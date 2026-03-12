@@ -1,0 +1,336 @@
+# AI Telemetry SDK
+
+Zero-dependency telemetry SDK for AI applications. Captures LLM prompts & responses, tool/function calls, token usage, latency, and errors — then batches and ships them to your platform.
+
+Designed like **Sentry** (easy install + API key) with the instrumentation depth of **Datadog**.
+
+---
+
+## How It Works
+
+```
+Your App → [AI Telemetry SDK] → (batched HTTPS) → Your Ingest Endpoint → Dashboard
+```
+
+1. **Register your app** on the platform → get an `app_id` and `api_key`
+2. **Install the SDK** and call `init()`
+3. The SDK **auto-patches** OpenAI / Anthropic clients (or use a LangChain callback)
+4. Events are **buffered** and flushed every 5 seconds (or when the batch hits 20 events)
+5. Your dashboard shows traces, token spend, error rates, and latency
+
+---
+
+## Python SDK
+
+### Install
+
+```bash
+pip install ai-telemetry-sdk                    # core only
+pip install "ai-telemetry-sdk[openai]"          # + OpenAI
+pip install "ai-telemetry-sdk[anthropic]"       # + Anthropic
+pip install "ai-telemetry-sdk[langchain]"       # + LangChain
+pip install "ai-telemetry-sdk[all]"             # everything
+```
+
+### Quickstart — OpenAI auto-patch
+
+```python
+import ai_telemetry as telemetry
+import openai
+
+# 1. Initialize once at app startup
+telemetry.init(
+    app_id="my-ai-app",
+    api_key="sk-telem-...",
+    auto_patch_openai=True,     # patches openai globally
+    capture_prompts=True,       # set False to redact content
+)
+
+# 2. Use OpenAI exactly as normal — telemetry is automatic
+client = openai.OpenAI()
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+```
+
+### Quickstart — Anthropic auto-patch
+
+```python
+import ai_telemetry as telemetry
+import anthropic
+
+telemetry.init(
+    app_id="my-ai-app",
+    api_key="sk-telem-...",
+    auto_patch_anthropic=True,
+)
+
+client = anthropic.Anthropic()
+response = client.messages.create(
+    model="claude-3-5-sonnet-20241022",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+```
+
+### Quickstart — LangChain
+
+```python
+import ai_telemetry as telemetry
+from ai_telemetry.integrations.langchain_integration import TelemetryCallbackHandler
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+t = telemetry.init(app_id="my-app", api_key="sk-telem-...")
+handler = TelemetryCallbackHandler(t)
+
+llm = ChatOpenAI(model="gpt-4o")
+prompt = ChatPromptTemplate.from_template("Tell me about {topic}")
+chain = prompt | llm
+
+result = chain.invoke({"topic": "AI observability"}, config={"callbacks": [handler]})
+```
+
+### Manual Instrumentation (any HTTP / custom model)
+
+```python
+import ai_telemetry as telemetry
+from ai_telemetry.decorators import trace_llm, trace_tool
+
+t = telemetry.init(app_id="my-app", api_key="sk-telem-...")
+
+@trace_llm(t, model="llama-3", provider="ollama")
+def call_local_model(prompt: str) -> str:
+    # ... your HTTP call ...
+    return "response text"
+
+@trace_tool(t, tool_name="web_search")
+def web_search(query: str) -> str:
+    # ... your tool logic ...
+    return "results"
+```
+
+### Manual Event Capture
+
+```python
+from ai_telemetry.client import TelemetryEvent
+
+t.capture(TelemetryEvent(
+    event_type="llm_call",
+    model="gpt-4o",
+    provider="openai",
+    prompt_tokens=150,
+    completion_tokens=45,
+    total_tokens=195,
+    latency_ms=823,
+    metadata={"user_id": "u_123", "session": "sess_abc"},
+))
+```
+
+### Zendata DLP & Security Integration (Python)
+
+This SDK natively supports real-time Data Loss Prevention (DLP) and Security evaluation via the **Zendata Engine**.
+
+#### Context Injection
+Use `current_user_context` from `ai_telemetry.context` to inject identity and risk data into your LLM traces.
+
+```python
+from ai_telemetry.context import current_user_context
+
+# Set this context per request
+current_user_context.set({
+    "user_id": "usr_123",
+    "email": "user@domain.com",
+    "department": "Finance",
+    "sailpoint_risk": "35",
+})
+```
+
+#### Evaluation and Logging
+When `llm_call` events are captured, the SDK intercepts the payload and queries the Zendata API to evaluate PII and security risks. 
+To enable this, configure your environment with:
+```env
+ZENDATA_ENGINE_URL=http://localhost:8080/evaluate
+ZENDATA_API_KEY=your_zendata_api_key
+ZENDATA_EVALUATION_MODE=blocking 
+```
+
+The output is written automatically to a flat, enriched CSV format at `logs/events.csv` containing merged metrics, user context, and Zendata risk signals (`pii_detected`, `trust_boundary_crossed`, `zendata_composite_risk`, etc.).
+
+### Configuration Reference
+
+| Parameter | Default | Description |
+|---|---|---|
+| `app_id` | required | Your registered app ID |
+| `api_key` | required | Your platform API key |
+| `endpoint` | `https://ingest.yourplatform.com/v1/events` | Ingest URL |
+| `capture_prompts` | `True` | Set `False` to redact all prompt/response content |
+| `batch_size` | `20` | Max events per HTTP request |
+| `flush_interval_s` | `5.0` | Background flush interval |
+| `auto_patch_openai` | `False` | Auto-instrument openai globally |
+| `auto_patch_anthropic` | `False` | Auto-instrument anthropic globally |
+| `debug` | `False` | Print SDK debug logs |
+
+---
+
+## JavaScript / TypeScript SDK
+
+### Install
+
+```bash
+npm install ai-telemetry-sdk
+```
+
+### Quickstart — OpenAI
+
+```typescript
+import OpenAI from "openai";
+import { init } from "ai-telemetry-sdk";
+import { wrapOpenAI } from "ai-telemetry-sdk/integrations/openai";
+
+// 1. Initialize
+const telemetry = init({
+  appId: "my-ai-app",
+  apiKey: "sk-telem-...",
+  capturePrompts: true,
+});
+
+// 2. Wrap your client
+const openai = wrapOpenAI(new OpenAI(), telemetry);
+
+// 3. Use normally
+const response = await openai.chat.completions.create({
+  model: "gpt-4o",
+  messages: [{ role: "user", content: "Hello!" }],
+});
+```
+
+### Quickstart — Anthropic
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import { init } from "ai-telemetry-sdk";
+import { wrapAnthropic } from "ai-telemetry-sdk/integrations/anthropic";
+
+const telemetry = init({ appId: "my-app", apiKey: "sk-telem-..." });
+const anthropic = wrapAnthropic(new Anthropic(), telemetry);
+
+const response = await anthropic.messages.create({
+  model: "claude-sonnet-4-20250514",
+  max_tokens: 1024,
+  messages: [{ role: "user", content: "Hello!" }],
+});
+```
+
+### Quickstart — LangChain
+
+```typescript
+import { init } from "ai-telemetry-sdk";
+import { TelemetryCallbackHandler } from "ai-telemetry-sdk/integrations/langchain";
+import { ChatOpenAI } from "@langchain/openai";
+
+const telemetry = init({ appId: "my-app", apiKey: "sk-telem-..." });
+const handler = new TelemetryCallbackHandler(telemetry);
+
+const llm = new ChatOpenAI({ model: "gpt-4o" });
+const result = await llm.invoke("Hello!", { callbacks: [handler] });
+```
+
+### Manual Instrumentation
+
+```typescript
+import { init, traceLLM, traceTool } from "ai-telemetry-sdk";
+
+const telemetry = init({ appId: "my-app", apiKey: "sk-telem-..." });
+
+const myLLM = traceLLM(
+  async (prompt: string) => { /* your HTTP call */ return "response"; },
+  telemetry,
+  { model: "llama-3", provider: "ollama" }
+);
+
+const myTool = traceTool(
+  async (query: string) => { /* tool logic */ return "result"; },
+  telemetry,
+  { toolName: "web_search" }
+);
+```
+
+### Graceful Shutdown (Node.js)
+
+```typescript
+process.on("SIGTERM", async () => {
+  await telemetry.shutdown();  // flushes remaining events
+  process.exit(0);
+});
+```
+
+### Configuration Reference
+
+| Option | Default | Description |
+|---|---|---|
+| `appId` | required | Your registered app ID |
+| `apiKey` | required | Your platform API key |
+| `endpoint` | `https://ingest.yourplatform.com/v1/events` | Ingest URL |
+| `capturePrompts` | `true` | Set `false` to redact content |
+| `batchSize` | `20` | Max events per HTTP request |
+| `flushIntervalMs` | `5000` | Background flush interval |
+| `debug` | `false` | Print SDK debug logs |
+
+---
+
+## Event Schema
+
+Every event sent to your platform follows this schema:
+
+```json
+{
+  "event_id": "uuid-v4",
+  "app_id": "my-ai-app",
+  "event_type": "llm_call | tool_call | error",
+  "timestamp_ms": 1741200000000,
+
+  "provider": "openai",
+  "model": "gpt-4o",
+  "latency_ms": 823,
+  "prompt_tokens": 150,
+  "completion_tokens": 45,
+  "total_tokens": 195,
+
+  "input_messages": [{"role": "user", "content": "Hello!"}],
+  "output_message": {"role": "assistant", "content": "Hi there!"},
+
+  "tool_name": "web_search",
+  "tool_input": {"query": "latest AI news"},
+  "tool_output": "...",
+
+  "error_type": "RateLimitError",
+  "error_message": "...",
+
+  "metadata": {"user_id": "u_123"}
+}
+```
+
+---
+
+## Privacy
+
+Set `capture_prompts: false` (Python) or `capturePrompts: false` (JS) to strip all prompt, response, and tool I/O content before events leave the process. Only structural metadata (model, tokens, latency, errors) is sent.
+
+---
+
+## License
+
+MIT
+
+## Framework Agnostic Design
+
+This telemetry SDK is completely framework-agnostic and works across LangGraph, CrewAI, ADK, and custom-built agent systems. Because the SDK operates at the lowest levels (network client patching, callbacks, and context variables), it integrates seamlessly regardless of your high-level agent framework:
+
+*   **Google ADK:** Use the `@trace_tool` and `@trace_llm` decorators on the specific tools and models the ADK orchestrates.
+*   **LangGraph & LangChain:** The SDK includes a native `TelemetryCallbackHandler`. Because LangGraph is built on LangChain, you simply pass this handler into the graph's execution config, and it automatically traces all nodes, edges, LLMs, and tools.
+*   **CrewAI:** CrewAI delegates to standard LLM clients (like `openai` or `anthropic`) under the hood. By initializing the SDK with `auto_patch_openai=True`, every time a CrewAI agent reaches out to an LLM, the SDK intercepts it, applies the Zendata DLP checks, and logs it—without needing to change a single line of CrewAI code.
+
+Because `current_user_context` is a standard Python `ContextVar`, it automatically propagates down the execution stack, meaning context like the user's identity and `sailpoint_risk` remains intact whether LangGraph, CrewAI, or ADK is managing the specific thread or coroutine.
+

@@ -1,0 +1,85 @@
+"""
+AI Telemetry SDK - OpenAI Integration
+Monkey-patches the OpenAI client to automatically capture telemetry.
+
+Usage:
+    from ai_telemetry.integrations.openai import patch_openai
+    patch_openai(telemetry_client)
+"""
+
+import time
+import traceback
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ai_telemetry.client import TelemetryClient
+
+
+def patch_openai(telemetry: "TelemetryClient"):
+    """
+    Patches openai.OpenAI and openai.AsyncOpenAI so every
+    chat.completions.create call is automatically traced.
+    """
+    try:
+        import openai
+    except ImportError:
+        raise ImportError("openai package is not installed. Run: pip install openai")
+
+    from ai_telemetry.client import TelemetryEvent
+
+    _original_create = openai.resources.chat.completions.Completions.create
+
+    def _patched_create(self_openai, *args, **kwargs):
+        start = time.time()
+        error_info = {}
+        response = None
+        try:
+            response = _original_create(self_openai, *args, **kwargs)
+            return response
+        except Exception as exc:
+            error_info = {
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "error_traceback": traceback.format_exc(),
+            }
+            raise
+        finally:
+            latency_ms = int((time.time() - start) * 1000)
+            messages = kwargs.get("messages", [])
+            model = kwargs.get("model", "unknown")
+
+            event = TelemetryEvent(
+                event_type="llm_call" if not error_info else "error",
+                provider="openai",
+                model=model,
+                latency_ms=latency_ms,
+                input_messages=list(messages),
+                **error_info,
+            )
+
+            if response is not None:
+                choice = response.choices[0] if response.choices else None
+                if choice:
+                    event.output_message = {
+                        "role": choice.message.role,
+                        "content": choice.message.content,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments,
+                                },
+                            }
+                            for tc in (choice.message.tool_calls or [])
+                        ] or None,
+                    }
+                if response.usage:
+                    event.prompt_tokens = response.usage.prompt_tokens
+                    event.completion_tokens = response.usage.completion_tokens
+                    event.total_tokens = response.usage.total_tokens
+
+            telemetry.capture(event)
+
+    openai.resources.chat.completions.Completions.create = _patched_create
+    return openai

@@ -1,0 +1,53 @@
+{
+  "name": "ai-telemetry-sdk",
+  "version": "1.0.0",
+  "description": "AI application telemetry — capture prompts, completions, tool calls, tokens, and errors.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./integrations/openai": {
+      "import": "./dist/integrations/openai.js",
+      "types": "./dist/integrations/openai.d.ts"
+    },
+    "./integrations/anthropic": {
+      "import": "./dist/integrations/anthropic.js",
+      "types": "./dist/integrations/anthropic.d.ts"
+    },
+    "./integrations/langchain": {
+      "import": "./dist/integrations/langchain.js",
+      "types": "./dist/integrations/langchain.d.ts"
+    },
+    "./trace": {
+      "import": "./dist/trace.js",
+      "types": "./dist/trace.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest"
+  },
+  "keywords": ["ai", "telemetry", "observability", "llm", "openai", "anthropic", "langchain"],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0",
+    "jest": "^29.0.0",
+    "@types/jest": "^29.0.0"
+  },
+  "peerDependencies": {
+    "openai": ">=1.0.0",
+    "@anthropic-ai/sdk": ">=0.20.0",
+    "@langchain/core": ">=0.1.0"
+  },
+  "peerDependenciesOptional": {
+    "openai": true,
+    "@anthropic-ai/sdk": true,
+    "@langchain/core": true
+  }
+}

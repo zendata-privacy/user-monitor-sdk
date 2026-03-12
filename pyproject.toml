@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-telemetry-sdk"
+version = "1.0.0"
+description = "AI application telemetry — capture prompts, completions, tool calls, tokens, and errors."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["ai", "telemetry", "observability", "llm", "openai", "anthropic", "langchain"]
+
+dependencies = []  # zero hard dependencies — integrations are optional
+
+[project.optional-dependencies]
+openai     = ["openai>=1.0"]
+anthropic  = ["anthropic>=0.20"]
+langchain  = ["langchain-core>=0.1"]
+all        = ["openai>=1.0", "anthropic>=0.20", "langchain-core>=0.1"]
+dev        = ["pytest", "pytest-asyncio", "black", "mypy"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ai_telemetry*"]
