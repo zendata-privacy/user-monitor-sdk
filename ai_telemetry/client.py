@@ -12,6 +12,7 @@ import urllib.request
 import urllib.error
 import os
 import csv
+import tempfile
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field, asdict
@@ -85,6 +86,8 @@ class TelemetryClient:
         max_queue_size: int = 1000,
         capture_prompts: bool = True,
         debug: bool = False,
+        enable_local_log: bool = False,
+        log_path: Optional[str] = None,
     ):
         self.app_id = app_id
         self.api_key = api_key
@@ -93,11 +96,20 @@ class TelemetryClient:
         self.flush_interval_s = flush_interval_s
         self.capture_prompts = capture_prompts
         self.debug = debug
+        self.enable_local_log = enable_local_log
+        self.log_path = log_path or os.path.join(
+            os.environ.get("ZENDATA_LOG_DIR", os.path.join(tempfile.gettempdir(), "zendata")),
+            "events.csv",
+        )
 
         self._queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
         self._shutdown = threading.Event()
         self._thread = threading.Thread(target=self._flush_loop, daemon=True)
         self._thread.start()
+
+        # Circuit breaker state
+        self._consecutive_failures: int = 0
+        self._circuit_open_until: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -106,11 +118,6 @@ class TelemetryClient:
     def capture(self, event: TelemetryEvent):
         """Enqueue a telemetry event (non-blocking)."""
         event.app_id = self.app_id
-
-        # Zendata Engine Real-Time Evaluation
-        if event.event_type == "llm_call":
-            from ai_telemetry.integrations.zendata_integration import evaluate_event
-            evaluate_event(event)
 
         if not self.capture_prompts:
             event.input_messages = None
@@ -150,63 +157,35 @@ class TelemetryClient:
             self.flush()
 
     def _send(self, events: List[TelemetryEvent]):
-        # Local logging implementation
-        log_dir = os.path.join(os.getcwd(), "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, "events.csv")
-        
-        headers = [
-            "event_id", "timestamp_iso", "event_type", "model", "prompt_tokens", 
-            "completion_tokens", "total_tokens", "latency_ms", "user_id", "email", 
-            "display_name", "department", "job_title", "sailpoint_risk", "pii_detected", 
-            "pii_types", "trust_boundary_crossed", "risk_signal", "zendata_composite_risk", 
-            "zendata_classification", "data_sources", "tools_called"
-        ]
-        
-        file_exists = os.path.isfile(log_file)
-        try:
-            with open(log_file, mode='a', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=headers, delimiter='\t')
-                if not file_exists:
-                    writer.writeheader()
-                
-                for e in events:
-                    ts_iso = datetime.fromtimestamp(e.timestamp_ms / 1000.0, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-                    row = {
-                        "event_id": e.event_id,
-                        "timestamp_iso": ts_iso,
-                        "event_type": e.event_type or "",
-                        "model": e.model or "",
-                        "prompt_tokens": e.prompt_tokens if e.prompt_tokens is not None else "",
-                        "completion_tokens": e.completion_tokens if e.completion_tokens is not None else "",
-                        "total_tokens": e.total_tokens if e.total_tokens is not None else "",
-                        "latency_ms": e.latency_ms if e.latency_ms is not None else "",
-                        "user_id": e.user_id or "",
-                        "email": e.email or "",
-                        "display_name": e.display_name or "",
-                        "department": e.department or "",
-                        "job_title": e.job_title or "",
-                        "sailpoint_risk": e.sailpoint_risk if e.sailpoint_risk is not None else "",
-                        "pii_detected": e.pii_detected if e.pii_detected is not None else "",
-                        "pii_types": e.pii_types or "",
-                        "trust_boundary_crossed": e.trust_boundary_crossed if e.trust_boundary_crossed is not None else "",
-                        "risk_signal": e.risk_signal or "",
-                        "zendata_composite_risk": e.zendata_composite_risk if e.zendata_composite_risk is not None else "",
-                        "zendata_classification": e.zendata_classification or "",
-                        "data_sources": e.data_sources or "",
-                        "tools_called": e.tools_called or "",
-                    }
-                    # Merge existing metadata fields just in case
-                    meta = e.metadata or {}
-                    for k, v in meta.items():
-                        if k in headers and not row.get(k):
-                            row[k] = v
-                    writer.writerow(row)
-        except Exception as ex:
-            if self.debug:
-                print(f"[AI Telemetry] Failed to write to local log file: {ex}")
+        # Zendata evaluation runs here, on the background thread (never on the caller's thread)
+        from ai_telemetry.integrations.zendata_integration import evaluate_event
+        for event in events:
+            if event.event_type == "llm_call":
+                evaluate_event(event)
 
-        # HTTP submission (unchanged)
+        # HTTP first — primary delivery path
+        self._send_http(events)
+
+        # CSV second — optional, best-effort; never allowed to block or raise
+        if self.enable_local_log:
+            try:
+                self._write_csv(events)
+            except Exception as ex:
+                if self.debug:
+                    print(f"[AI Telemetry] CSV write failed (non-fatal): {ex}")
+
+    def _send_http(self, events: List[TelemetryEvent]):
+        _MAX_RETRIES = 3
+        _BACKOFF_BASE = 1.0
+        _CIRCUIT_THRESHOLD = 5
+        _CIRCUIT_COOLDOWN_S = 30.0
+
+        # Circuit breaker: skip entirely if endpoint is known-down
+        if self._circuit_open_until > time.time():
+            if self.debug:
+                print("[AI Telemetry] Circuit open — skipping send")
+            return
+
         payload = json.dumps({"events": [e.to_dict() for e in events]}).encode()
         req = urllib.request.Request(
             self.endpoint,
@@ -218,11 +197,87 @@ class TelemetryClient:
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+
+        last_err: Exception = Exception("unknown")
+        for attempt in range(_MAX_RETRIES):
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if self.debug:
+                        print(f"[AI Telemetry] Flushed {len(events)} events → {resp.status}")
+                    self._consecutive_failures = 0
+                    return  # success
+            except urllib.error.HTTPError as e:
+                if e.code < 500:
+                    # 4xx — client error, don't retry
+                    self._consecutive_failures = 0
+                    if self.debug:
+                        print(f"[AI Telemetry] Send failed (client error {e.code}): {e}")
+                    return
+                last_err = e  # 5xx — fall through to retry
+            except urllib.error.URLError as e:
+                last_err = e  # network error — retry
+
+            if attempt < _MAX_RETRIES - 1:
+                wait = _BACKOFF_BASE * (2 ** attempt)
                 if self.debug:
-                    print(f"[AI Telemetry] Flushed {len(events)} events → {resp.status}")
-        except urllib.error.URLError as e:
+                    print(f"[AI Telemetry] Retry {attempt + 1}/{_MAX_RETRIES} in {wait}s: {last_err}")
+                time.sleep(wait)
+
+        # All retries exhausted
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= _CIRCUIT_THRESHOLD:
+            self._circuit_open_until = time.time() + _CIRCUIT_COOLDOWN_S
             if self.debug:
-                print(f"[AI Telemetry] Send failed: {e}")
-            pass # Keep submission, but pass if it fails
+                print(f"[AI Telemetry] Circuit opened for {_CIRCUIT_COOLDOWN_S}s after {self._consecutive_failures} consecutive failures")
+        if self.debug:
+            print(f"[AI Telemetry] Send failed after {_MAX_RETRIES} retries: {last_err}")
+
+    def _write_csv(self, events: List[TelemetryEvent]):
+        headers = [
+            "event_id", "timestamp_iso", "event_type", "model", "prompt_tokens",
+            "completion_tokens", "total_tokens", "latency_ms", "user_id", "email",
+            "display_name", "department", "job_title", "sailpoint_risk", "pii_detected",
+            "pii_types", "trust_boundary_crossed", "risk_signal", "zendata_composite_risk",
+            "zendata_classification", "data_sources", "tools_called"
+        ]
+
+        log_file = self.log_path
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        file_exists = os.path.isfile(log_file)
+
+        with open(log_file, mode='a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=headers, delimiter='\t')
+            if not file_exists:
+                writer.writeheader()
+
+            for e in events:
+                ts_iso = datetime.fromtimestamp(e.timestamp_ms / 1000.0, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                row = {
+                    "event_id": e.event_id,
+                    "timestamp_iso": ts_iso,
+                    "event_type": e.event_type or "",
+                    "model": e.model or "",
+                    "prompt_tokens": e.prompt_tokens if e.prompt_tokens is not None else "",
+                    "completion_tokens": e.completion_tokens if e.completion_tokens is not None else "",
+                    "total_tokens": e.total_tokens if e.total_tokens is not None else "",
+                    "latency_ms": e.latency_ms if e.latency_ms is not None else "",
+                    "user_id": e.user_id or "",
+                    "email": e.email or "",
+                    "display_name": e.display_name or "",
+                    "department": e.department or "",
+                    "job_title": e.job_title or "",
+                    "sailpoint_risk": e.sailpoint_risk if e.sailpoint_risk is not None else "",
+                    "pii_detected": e.pii_detected if e.pii_detected is not None else "",
+                    "pii_types": e.pii_types or "",
+                    "trust_boundary_crossed": e.trust_boundary_crossed if e.trust_boundary_crossed is not None else "",
+                    "risk_signal": e.risk_signal or "",
+                    "zendata_composite_risk": e.zendata_composite_risk if e.zendata_composite_risk is not None else "",
+                    "zendata_classification": e.zendata_classification or "",
+                    "data_sources": e.data_sources or "",
+                    "tools_called": e.tools_called or "",
+                }
+                meta = e.metadata or {}
+                for k, v in meta.items():
+                    if k in headers and not row.get(k):
+                        row[k] = v
+                writer.writerow(row)

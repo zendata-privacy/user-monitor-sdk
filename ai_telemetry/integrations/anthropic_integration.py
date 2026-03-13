@@ -80,4 +80,60 @@ def patch_anthropic(telemetry: "TelemetryClient"):
             telemetry.capture(event)
 
     anthropic.resources.messages.Messages.create = _patched_create
+
+    # ------------------------------------------------------------------
+    # Async patch — AsyncAnthropic / AsyncMessages.create
+    # ------------------------------------------------------------------
+    _original_async_create = anthropic.resources.messages.AsyncMessages.create
+
+    async def _patched_async_create(self_anthropic, *args, **kwargs):
+        start = time.time()
+        error_info = {}
+        response = None
+        try:
+            response = await _original_async_create(self_anthropic, *args, **kwargs)
+            return response
+        except Exception as exc:
+            error_info = {
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "error_traceback": traceback.format_exc(),
+            }
+            raise
+        finally:
+            latency_ms = int((time.time() - start) * 1000)
+            messages = kwargs.get("messages", [])
+            model = kwargs.get("model", "unknown")
+
+            event = TelemetryEvent(
+                event_type="llm_call" if not error_info else "error",
+                provider="anthropic",
+                model=model,
+                latency_ms=latency_ms,
+                input_messages=list(messages),
+                **error_info,
+            )
+
+            if response is not None:
+                text_blocks = [b for b in response.content if b.type == "text"]
+                tool_blocks = [b for b in response.content if b.type == "tool_use"]
+
+                event.output_message = {
+                    "role": "assistant",
+                    "content": text_blocks[0].text if text_blocks else None,
+                    "tool_calls": [
+                        {"id": tb.id, "name": tb.name, "input": tb.input}
+                        for tb in tool_blocks
+                    ] or None,
+                }
+                if response.usage:
+                    event.prompt_tokens = response.usage.input_tokens
+                    event.completion_tokens = response.usage.output_tokens
+                    event.total_tokens = (
+                        response.usage.input_tokens + response.usage.output_tokens
+                    )
+
+            telemetry.capture(event)
+
+    anthropic.resources.messages.AsyncMessages.create = _patched_async_create
     return anthropic
