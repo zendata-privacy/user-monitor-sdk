@@ -3,6 +3,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { _traceStorage } from "./context.js";
 
 export interface TelemetryEvent {
   event_id?: string;
@@ -29,6 +30,11 @@ export interface TelemetryEvent {
   error_type?: string;
   error_message?: string;
   error_stack?: string;
+
+  // Trace context — links events into an execution chain
+  trace_id?: string;
+  span_id?: string;
+  parent_span_id?: string;
 
   // Custom metadata
   metadata?: Record<string, unknown>;
@@ -68,7 +74,7 @@ export class TelemetryClient {
   constructor(opts: TelemetryClientOptions) {
     this.appId = opts.appId;
     this.apiKey = opts.apiKey;
-    this.endpoint = opts.endpoint ?? "https://ingest.yourplatform.com/v1/events";
+    this.endpoint = opts.endpoint ?? "https://ingest.zendata.dev/v1/events";
     this.batchSize = opts.batchSize ?? 20;
     this.maxQueueSize = opts.maxQueueSize ?? 1000;
     this.capturePrompts = opts.capturePrompts ?? true;
@@ -78,6 +84,12 @@ export class TelemetryClient {
     this.flushTimer = setInterval(() => this.flush(), intervalMs);
     // Don't block process exit
     this.flushTimer.unref();
+
+    // Flush on process exit — use once() to avoid stacking handlers across
+    // multiple TelemetryClient instances and to not override existing handlers
+    process.once("beforeExit", () => this.flush());
+    process.once("SIGTERM", () => { this.shutdown().finally(() => process.exit(0)); });
+    process.once("SIGINT",  () => { this.shutdown().finally(() => process.exit(0)); });
   }
 
   /** Enqueue a telemetry event (non-blocking). */
@@ -88,6 +100,18 @@ export class TelemetryClient {
       app_id: this.appId,
       ...event,
     };
+
+    // Auto-populate trace context from AsyncLocalStorage if not explicitly set
+    const store = _traceStorage.getStore();
+    if (!enriched.trace_id && store?.traceId) {
+      enriched.trace_id = store.traceId;
+    }
+    if (!enriched.span_id) {
+      enriched.span_id = randomUUID();
+    }
+    if (!enriched.parent_span_id && store?.spanId) {
+      enriched.parent_span_id = store.spanId;
+    }
 
     if (!this.capturePrompts) {
       delete enriched.input_messages;

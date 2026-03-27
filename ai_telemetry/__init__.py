@@ -2,9 +2,17 @@
 AI Telemetry SDK for Python
 """
 
+from importlib.metadata import version as _metadata_version, PackageNotFoundError
+from typing import Optional
+
+try:
+    __version__ = _metadata_version("ai-telemetry-sdk")
+except PackageNotFoundError:
+    __version__ = "0.0.0"
+
 from ai_telemetry.client import TelemetryClient, TelemetryEvent
 from ai_telemetry.decorators import trace_llm, trace_tool
-from ai_telemetry.context import current_user_context
+from ai_telemetry.context import current_user_context, TraceContext
 
 _default_client: TelemetryClient | None = None
 
@@ -12,11 +20,13 @@ _default_client: TelemetryClient | None = None
 def init(
     app_id: str,
     api_key: str,
-    endpoint: str = "https://ingest.yourplatform.com/v1/events",
+    endpoint: str = "https://ingest.zendata.dev/v1/events",
     capture_prompts: bool = True,
     auto_patch_openai: bool = False,
     auto_patch_anthropic: bool = False,
     debug: bool = False,
+    enable_local_log: bool = False,
+    log_path: Optional[str] = None,
 ) -> TelemetryClient:
     """
     Initialize the AI Telemetry SDK.
@@ -51,6 +61,8 @@ def init(
         endpoint=endpoint,
         capture_prompts=capture_prompts,
         debug=debug,
+        enable_local_log=enable_local_log,
+        log_path=log_path,
     )
     _default_client = client
 
@@ -76,10 +88,12 @@ def get_client() -> TelemetryClient:
 
 
 __all__ = [
+    "__version__",
     "init",
     "get_client",
     "TelemetryClient",
     "TelemetryEvent",
+    "TraceContext",
     "trace_llm",
     "trace_tool",
 ]

@@ -3,6 +3,7 @@ AI Telemetry SDK - Core Client
 Sends telemetry events to your configured endpoint.
 """
 
+import atexit
 import time
 import uuid
 import threading
@@ -61,6 +62,20 @@ class TelemetryEvent:
     data_sources: Optional[str] = None
     tools_called: Optional[str] = None
 
+    # Trace context — links events into an execution chain
+    trace_id: Optional[str] = None
+    span_id: Optional[str] = None
+    parent_span_id: Optional[str] = None
+
+    # Entity classification (populated by entity_classifier)
+    entity_type: Optional[str] = None              # HUMAN | AUTOMATED | AGENT | UNKNOWN
+    entity_subtype: Optional[str] = None           # SUBAGENT_RECEIVER | ORCHESTRATOR_SENDER
+    classification_signals: Optional[str] = None   # pipe-delimited rule IDs that fired
+    behavioral_alerts: Optional[str] = None        # pipe-delimited alert names
+    session_turn_index: Optional[int] = None       # 0-based turn number within the session
+    inter_turn_latency_ms: Optional[int] = None    # ms between last response and this submission
+    prompt_submission_time_ms: Optional[int] = None  # epoch ms when the prompt was submitted
+
     # Custom metadata
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -73,14 +88,14 @@ class TelemetryClient:
     Core telemetry client. Buffers events and flushes them in a background thread.
 
     Usage:
-        client = TelemetryClient(app_id="my-app", api_key="sk-...", endpoint="https://your-platform/ingest")
+        client = TelemetryClient(app_id="my-app", api_key="sk-...")
     """
 
     def __init__(
         self,
         app_id: str,
         api_key: str,
-        endpoint: str = "https://ingest.yourplatform.com/v1/events",
+        endpoint: str = "https://ingest.zendata.dev/v1/events",
         batch_size: int = 20,
         flush_interval_s: float = 5.0,
         max_queue_size: int = 1000,
@@ -106,6 +121,7 @@ class TelemetryClient:
         self._shutdown = threading.Event()
         self._thread = threading.Thread(target=self._flush_loop, daemon=True)
         self._thread.start()
+        atexit.register(self.shutdown)
 
         # Circuit breaker state
         self._consecutive_failures: int = 0
@@ -118,6 +134,46 @@ class TelemetryClient:
     def capture(self, event: TelemetryEvent):
         """Enqueue a telemetry event (non-blocking)."""
         event.app_id = self.app_id
+
+        # Auto-populate trace context from context vars if not explicitly set on the event
+        from ai_telemetry.context import _current_trace_id, _current_span_id, current_user_context
+        if not event.trace_id:
+            tid = _current_trace_id.get()
+            event.trace_id = tid or None
+        if not event.span_id:
+            event.span_id = str(uuid.uuid4())
+        if not event.parent_span_id:
+            pid = _current_span_id.get()
+            event.parent_span_id = pid or None
+
+        # Entity classification
+        user_ctx = current_user_context.get()
+        entity_key = user_ctx.get("user_id") or "unknown"
+        session_id = event.trace_id or entity_key
+
+        if event.event_type == "llm_call":
+            # Full classification — runs rules and updates session state
+            prompt_text = user_ctx.get("prompt_text", "")
+            if prompt_text:
+                from ai_telemetry.entity_classifier import classify_event
+                from ai_telemetry.session_state import get_session_store
+                submission_ms = user_ctx.get("prompt_submission_time_ms") or event.timestamp_ms
+                classify_event(
+                    event,
+                    get_session_store(),
+                    session_id,
+                    entity_key,
+                    prompt_text,
+                    submission_ms,
+                )
+
+        elif event.event_type == "tool_call":
+            # Inherit entity type from the session established by the preceding LLM call
+            from ai_telemetry.session_state import get_session_store
+            state = get_session_store().get_or_create_session(session_id, entity_key)
+            if state.entity_type != "UNKNOWN":
+                event.entity_type = state.entity_type
+                event.entity_subtype = state.entity_subtype
 
         if not self.capture_prompts:
             event.input_messages = None
@@ -166,13 +222,18 @@ class TelemetryClient:
         # HTTP first — primary delivery path
         self._send_http(events)
 
-        # CSV second — optional, best-effort; never allowed to block or raise
+        # CSV + JSONL — optional, best-effort; never allowed to block or raise
         if self.enable_local_log:
             try:
                 self._write_csv(events)
             except Exception as ex:
                 if self.debug:
                     print(f"[AI Telemetry] CSV write failed (non-fatal): {ex}")
+            try:
+                self._write_jsonl(events)
+            except Exception as ex:
+                if self.debug:
+                    print(f"[AI Telemetry] JSONL write failed (non-fatal): {ex}")
 
     def _send_http(self, events: List[TelemetryEvent]):
         _MAX_RETRIES = 3
@@ -186,7 +247,17 @@ class TelemetryClient:
                 print("[AI Telemetry] Circuit open — skipping send")
             return
 
-        payload = json.dumps({"events": [e.to_dict() for e in events]}).encode()
+        serializable = []
+        for e in events:
+            try:
+                json.dumps(e.to_dict())  # validate before batching
+                serializable.append(e.to_dict())
+            except (TypeError, ValueError) as ex:
+                if self.debug:
+                    print(f"[AI Telemetry] Skipping non-serializable event {e.event_id}: {ex}")
+        if not serializable:
+            return
+        payload = json.dumps({"events": serializable}).encode()
         req = urllib.request.Request(
             self.endpoint,
             data=payload,
@@ -234,11 +305,13 @@ class TelemetryClient:
 
     def _write_csv(self, events: List[TelemetryEvent]):
         headers = [
-            "event_id", "timestamp_iso", "event_type", "model", "prompt_tokens",
-            "completion_tokens", "total_tokens", "latency_ms", "user_id", "email",
-            "display_name", "department", "job_title", "sailpoint_risk", "pii_detected",
-            "pii_types", "trust_boundary_crossed", "risk_signal", "zendata_composite_risk",
-            "zendata_classification", "data_sources", "tools_called"
+            "event_id", "timestamp_iso", "event_type", "trace_id", "span_id", "parent_span_id",
+            "model", "prompt_tokens", "completion_tokens", "total_tokens", "latency_ms",
+            "user_id", "email", "display_name", "department", "job_title", "sailpoint_risk",
+            "pii_detected", "pii_types", "trust_boundary_crossed", "risk_signal",
+            "zendata_composite_risk", "zendata_classification", "data_sources", "tools_called",
+            "entity_type", "entity_subtype", "classification_signals", "behavioral_alerts",
+            "session_turn_index", "inter_turn_latency_ms",
         ]
 
         log_file = self.log_path
@@ -246,7 +319,7 @@ class TelemetryClient:
         file_exists = os.path.isfile(log_file)
 
         with open(log_file, mode='a', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=headers, delimiter='\t')
+            writer = csv.DictWriter(f, fieldnames=headers, delimiter=',')
             if not file_exists:
                 writer.writeheader()
 
@@ -256,6 +329,9 @@ class TelemetryClient:
                     "event_id": e.event_id,
                     "timestamp_iso": ts_iso,
                     "event_type": e.event_type or "",
+                    "trace_id": e.trace_id or "",
+                    "span_id": e.span_id or "",
+                    "parent_span_id": e.parent_span_id or "",
                     "model": e.model or "",
                     "prompt_tokens": e.prompt_tokens if e.prompt_tokens is not None else "",
                     "completion_tokens": e.completion_tokens if e.completion_tokens is not None else "",
@@ -275,9 +351,37 @@ class TelemetryClient:
                     "zendata_classification": e.zendata_classification or "",
                     "data_sources": e.data_sources or "",
                     "tools_called": e.tools_called or "",
+                    "entity_type": e.entity_type or "",
+                    "entity_subtype": e.entity_subtype or "",
+                    "classification_signals": e.classification_signals or "",
+                    "behavioral_alerts": e.behavioral_alerts or "",
+                    "session_turn_index": e.session_turn_index if e.session_turn_index is not None else "",
+                    "inter_turn_latency_ms": e.inter_turn_latency_ms if e.inter_turn_latency_ms is not None else "",
                 }
                 meta = e.metadata or {}
                 for k, v in meta.items():
                     if k in headers and not row.get(k):
                         row[k] = v
                 writer.writerow(row)
+
+    def _write_jsonl(self, events: List[TelemetryEvent]):
+        """Append events to a newline-delimited JSON file (one object per line).
+
+        The file path is derived from ``log_path`` by replacing the extension
+        with ``.jsonl``.  Each line is a complete, self-contained JSON object
+        including a human-readable ``timestamp_iso`` field.
+        """
+        jsonl_path = os.path.splitext(self.log_path)[0] + ".jsonl"
+        os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
+
+        with open(jsonl_path, mode="a", encoding="utf-8") as f:
+            for e in events:
+                try:
+                    d = e.to_dict()
+                    d["timestamp_iso"] = datetime.fromtimestamp(
+                        e.timestamp_ms / 1000.0, tz=timezone.utc
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    f.write(json.dumps(d) + "\n")
+                except (TypeError, ValueError) as ex:
+                    if self.debug:
+                        print(f"[AI Telemetry] Skipping non-serializable event {e.event_id}: {ex}")

@@ -5,6 +5,7 @@
 export { TelemetryClient } from "./client.js";
 export type { TelemetryEvent, TelemetryClientOptions } from "./client.js";
 export { traceLLM, traceTool } from "./trace.js";
+export { TraceContext } from "./context.js";
 
 // Convenience factory ---------------------------------------------------------
 import { TelemetryClient, TelemetryClientOptions } from "./client.js";

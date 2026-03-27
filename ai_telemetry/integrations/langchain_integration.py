@@ -83,26 +83,40 @@ def create_langchain_handler(telemetry: "TelemetryClient"):
             **kwargs,
         ):
             from ai_telemetry.client import TelemetryEvent
+            from ai_telemetry.context import current_user_context
 
             start = self._start_times.pop(str(run_id), time.time())
             latency_ms = int((time.time() - start) * 1000)
 
             llm_output = response.llm_output or {}
-            usage = llm_output.get("token_usage", {})
+            usage = llm_output.get("token_usage") or {}
 
             # Flatten generations
             all_generations = [g for row in response.generations for g in row]
             output_text = all_generations[0].text if all_generations else None
 
+            # Pull user context so entity classification and user fields are populated
+            user_ctx = current_user_context.get()
+
             event = TelemetryEvent(
                 event_type="llm_call",
-                provider="langchain",
+                provider="openai",
                 model=llm_output.get("model_name", "unknown"),
                 latency_ms=latency_ms,
                 output_message={"role": "assistant", "content": output_text},
                 prompt_tokens=usage.get("prompt_tokens"),
                 completion_tokens=usage.get("completion_tokens"),
                 total_tokens=usage.get("total_tokens"),
+                # User context — required for entity classification
+                user_id=user_ctx.get("user_id"),
+                email=user_ctx.get("email"),
+                display_name=user_ctx.get("display_name"),
+                department=user_ctx.get("department"),
+                job_title=user_ctx.get("job_title"),
+                sailpoint_risk=user_ctx.get("sailpoint_risk"),
+                data_sources=user_ctx.get("data_sources"),
+                tools_called=user_ctx.get("tools_called"),
+                prompt_submission_time_ms=user_ctx.get("prompt_submission_time_ms"),
             )
             self.telemetry.capture(event)
 

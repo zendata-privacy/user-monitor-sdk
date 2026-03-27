@@ -1,9 +1,12 @@
 import os
+import re
 import json
 import urllib.request
 import urllib.error
 import urllib.parse
 from typing import TYPE_CHECKING
+
+_EMAIL_PATTERN = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 
 if TYPE_CHECKING:
     from ai_telemetry.client import TelemetryEvent
@@ -68,7 +71,7 @@ def _mock_evaluate(event: "TelemetryEvent") -> None:
     pii_types = []
     if "ssn" in content or "social security" in content:
         pii_types.append("SSN")
-    if "email" in content or "@firstmeridianbank.com" in content:
+    if _EMAIL_PATTERN.search(content):
         pii_types.append("Email")
         
     event.pii_detected = len(pii_types) > 0

@@ -152,6 +152,36 @@ t.capture(TelemetryEvent(
 ))
 ```
 
+### Zendata DLP & Security Integration (Python)
+
+This SDK natively supports real-time Data Loss Prevention (DLP) and Security evaluation via the **Zendata Engine**.
+
+#### Context Injection
+Use `current_user_context` from `ai_telemetry.context` to inject identity and risk data into your LLM traces.
+
+```python
+from ai_telemetry.context import current_user_context
+
+# Set this context per request
+current_user_context.set({
+    "user_id": "usr_123",
+    "email": "user@domain.com",
+    "department": "Finance",
+    "sailpoint_risk": "35",
+})
+```
+
+#### Evaluation and Logging
+When `llm_call` events are captured, the SDK intercepts the payload and queries the Zendata API to evaluate PII and security risks. 
+To enable this, configure your environment with:
+```env
+ZENDATA_ENGINE_URL=http://localhost:8080/evaluate
+ZENDATA_API_KEY=your_zendata_api_key
+ZENDATA_EVALUATION_MODE=blocking 
+```
+
+The output is written automatically to a flat, enriched CSV format at `logs/events.csv` containing merged metrics, user context, and Zendata risk signals (`pii_detected`, `trust_boundary_crossed`, `zendata_composite_risk`, etc.).
+
 ### Configuration Reference
 
 | Parameter | Default | Description |
@@ -317,3 +347,14 @@ Set `capture_prompts: false` (Python) or `capturePrompts: false` (JS) to strip a
 ## License
 
 MIT
+
+## Framework Agnostic Design
+
+This telemetry SDK is completely framework-agnostic and works across LangGraph, CrewAI, ADK, and custom-built agent systems. Because the SDK operates at the lowest levels (network client patching, callbacks, and context variables), it integrates seamlessly regardless of your high-level agent framework:
+
+*   **Google ADK:** Use the `@trace_tool` and `@trace_llm` decorators on the specific tools and models the ADK orchestrates.
+*   **LangGraph & LangChain:** The SDK includes a native `TelemetryCallbackHandler`. Because LangGraph is built on LangChain, you simply pass this handler into the graph's execution config, and it automatically traces all nodes, edges, LLMs, and tools.
+*   **CrewAI:** CrewAI delegates to standard LLM clients (like `openai` or `anthropic`) under the hood. By initializing the SDK with `auto_patch_openai=True`, every time a CrewAI agent reaches out to an LLM, the SDK intercepts it, applies the Zendata DLP checks, and logs it—without needing to change a single line of CrewAI code.
+
+Because `current_user_context` is a standard Python `ContextVar`, it automatically propagates down the execution stack, meaning context like the user's identity and `sailpoint_risk` remains intact whether LangGraph, CrewAI, or ADK is managing the specific thread or coroutine.
+

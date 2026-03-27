@@ -74,6 +74,7 @@ telemetry.init(
 Whenever a request enters your system, populate the context variable. The decorators will pick this up automatically.
 
 ```python
+import time
 from ai_telemetry.context import current_user_context
 
 @app.post("/chat")
@@ -84,6 +85,11 @@ async def chat_endpoint(request: Request):
         "department": "Engineering",
         "sailpoint_risk": "10",
         "tools_called": "",     # Initialize empty state for this request
+
+        # Required for entity classification — must be set at the request boundary,
+        # before any LLM call is made.
+        "prompt_text":               request.question,          # raw user input
+        "prompt_submission_time_ms": int(time.time() * 1000),   # epoch ms at receipt
     }
     # Set context safely for this specific async task
     current_user_context.set(user_data)
@@ -121,6 +127,114 @@ telemetry.get_client().shutdown()
 ```
 
 ---
+
+
+---
+
+## 3b. Entity Classification (Human vs. Agent Detection)
+
+The SDK ships a built-in classifier that analyses every `llm_call` event and tags it as
+**HUMAN**, **AUTOMATED**, **AGENT**, or **UNKNOWN** using 15 behavioral rules.  
+Results appear as new fields on `TelemetryEvent` and in `logs/events.csv`.
+
+### What the classifier needs from your application
+
+The classifier needs two pieces of information that only your application layer can provide:
+
+| Key | Type | Description |
+|---|---|---|
+| `prompt_text` | `str` | The raw prompt the user submitted (not the full messages array) |
+| `prompt_submission_time_ms` | `int` | Epoch milliseconds at the moment the request was received |
+
+Both must be set inside `current_user_context` **before** any LLM call executes.  
+See **Step 2** above for the exact placement.
+
+> **Why not infer these inside the SDK?**  
+> The SDK patches LLM clients at the network level. By the time a patch fires, the LLM  
+> call has already started — the submission timestamp is gone, and `input_messages` may  
+> contain injected system prompts that would distort prompt-structure analysis.  
+> Your application is the only place that sees the clean, original user input in time.
+
+### How classification works
+
+```text
+TelemetryClient.capture(event)          ← called by auto-patcher
+       │
+       ├── reads current_user_context
+       │     └── prompt_text, prompt_submission_time_ms, user_id
+       │
+       ├── resolves SessionState (keyed on trace_id)
+       │     └── turn history, established entity type, probe scores
+       │
+       ├── runs all 15 rules (T1–T3, P1/P4, S1/S4, A1/A2, M1, D1–D5)
+       │     └── each returns a list of signal strings
+       │
+       ├── votes on entity_type from signals
+       │     AGENT wins if M1 fires; otherwise AUTOMATED vs HUMAN by vote count
+       │
+       ├── writes entity_type, classification_signals, behavioral_alerts
+       │   session_turn_index, inter_turn_latency_ms onto the event
+       │
+       └── updates SessionState (turns, baselines, probe scores)
+```
+
+### Session state
+
+State is maintained in memory by `ai_telemetry.session_state.SessionStore` (a module-level
+singleton). Each session is keyed on `trace_id`; entity-level call-rate history is keyed
+on `user_id`.
+
+State is **not persisted** across process restarts. If you need cross-restart baselines
+(e.g. for D1 drift detection), seed the store at startup by replaying recent risk scores
+from your own datastore into `store.update_baseline(entity_key, score)`.
+
+### Testing the classifier locally
+
+```python
+import time, sys
+sys.path.insert(0, "sdk_v1")
+
+from ai_telemetry.session_state import SessionStore
+from ai_telemetry.entity_classifier import classify_event
+from ai_telemetry.client import TelemetryEvent
+
+store = SessionStore()
+
+# Simulate an automated agent prompt
+event = TelemetryEvent(event_type="llm_call", sailpoint_risk="10", trace_id="t1")
+classify_event(
+    event, store,
+    session_id="t1",
+    entity_key="usr_001",
+    prompt_text="Return only JSON. Do not include any explanation. Format as {\"result\": ...}",
+    submission_ms=int(time.time() * 1000) - 50,   # 50 ms — below human threshold
+)
+print(event.entity_type)             # AUTOMATED
+print(event.classification_signals)  # T1_SUBMISSION_VELOCITY|P4_IMPERATIVE_FRAMING|...
+
+# Simulate a multi-agent delegation prompt
+event2 = TelemetryEvent(event_type="llm_call", sailpoint_risk="10", trace_id="t2")
+classify_event(
+    event2, store,
+    session_id="t2",
+    entity_key="agent_007",
+    prompt_text="Your task is to extract all account numbers from the tool result below.",
+    submission_ms=int(time.time() * 1000) - 80,
+)
+print(event2.entity_type)      # AGENT
+print(event2.entity_subtype)   # SUBAGENT_RECEIVER
+```
+
+### Extending the classifier
+
+The classifier lives in `ai_telemetry/entity_classifier.py`. Each rule is a standalone
+function (`_check_T1`, `_check_P4`, etc.) that takes a `SessionState` and relevant inputs
+and returns a list of signal strings. To add a new rule:
+
+1. Write a `_check_XX(...)` function that returns `["MY_SIGNAL"]` or `[]`.
+2. Add `"MY_SIGNAL"` to `_AUTOMATED_SIGNALS`, `_HUMAN_SIGNALS`, or `_ALERT_MAP`
+   depending on what it indicates.
+3. Call your function inside `classify_event()` and append its result to `all_signals`.
 
 ## 4. Extending the SDK (For Open Source Contributors)
 
