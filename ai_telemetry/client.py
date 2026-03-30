@@ -151,6 +151,8 @@ class TelemetryClient:
         entity_key = user_ctx.get("user_id") or "unknown"
         session_id = event.trace_id or entity_key
 
+        forced_entity = user_ctx.get("force_entity_type")
+
         if event.event_type == "llm_call":
             # Full classification — runs rules and updates session state
             prompt_text = user_ctx.get("prompt_text", "")
@@ -166,12 +168,23 @@ class TelemetryClient:
                     prompt_text,
                     submission_ms,
                 )
+            # Caller may force entity type (e.g. requests routed through an AI agent pipeline)
+            # while still preserving all behavioral signals and alerts from the classifier.
+            if forced_entity:
+                event.entity_type = forced_entity
+                from ai_telemetry.session_state import get_session_store
+                store = get_session_store()
+                state = store.get_or_create_session(session_id, entity_key)
+                state.entity_type = forced_entity
+                store.update_session(state)
 
         elif event.event_type == "tool_call":
             # Inherit entity type from the session established by the preceding LLM call
             from ai_telemetry.session_state import get_session_store
             state = get_session_store().get_or_create_session(session_id, entity_key)
-            if state.entity_type != "UNKNOWN":
+            if forced_entity:
+                event.entity_type = forced_entity
+            elif state.entity_type != "UNKNOWN":
                 event.entity_type = state.entity_type
                 event.entity_subtype = state.entity_subtype
 
