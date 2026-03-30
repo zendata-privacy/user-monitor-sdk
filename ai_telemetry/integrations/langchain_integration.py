@@ -89,11 +89,56 @@ def create_langchain_handler(telemetry: "TelemetryClient"):
             latency_ms = int((time.time() - start) * 1000)
 
             llm_output = response.llm_output or {}
-            usage = llm_output.get("token_usage") or {}
 
             # Flatten generations
             all_generations = [g for row in response.generations for g in row]
             output_text = all_generations[0].text if all_generations else None
+
+            # Extract token usage — try multiple locations across LangChain versions:
+            # 1. llm_output["token_usage"]  (older langchain-openai style)
+            # 2. llm_output["usage"]         (some providers)
+            # 3. generation.message.usage_metadata (langchain-openai >=0.2 / core >=0.2)
+            # 4. generation.message.response_metadata["token_usage"]
+            prompt_tokens = completion_tokens = total_tokens = None
+
+            usage = llm_output.get("token_usage") or llm_output.get("usage") or {}
+            if usage:
+                prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens")
+                completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens")
+                total_tokens = usage.get("total_tokens")
+
+            if total_tokens is None and all_generations:
+                gen = all_generations[0]
+                msg = getattr(gen, "message", None)
+                if msg is not None:
+                    # usage_metadata: {"input_tokens": N, "output_tokens": N, "total_tokens": N}
+                    um = getattr(msg, "usage_metadata", None) or {}
+                    if um:
+                        prompt_tokens = um.get("input_tokens")
+                        completion_tokens = um.get("output_tokens")
+                        total_tokens = um.get("total_tokens")
+
+                    if total_tokens is None:
+                        # response_metadata may hold token_usage dict
+                        rm = getattr(msg, "response_metadata", None) or {}
+                        tu = rm.get("token_usage") or rm.get("usage") or {}
+                        if tu:
+                            prompt_tokens = tu.get("prompt_tokens") or tu.get("input_tokens")
+                            completion_tokens = tu.get("completion_tokens") or tu.get("output_tokens")
+                            total_tokens = tu.get("total_tokens")
+
+            if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+                total_tokens = prompt_tokens + completion_tokens
+
+            # Extract model name — try llm_output first, then generation response_metadata
+            model_name = llm_output.get("model_name") or llm_output.get("model")
+            if not model_name and all_generations:
+                gen = all_generations[0]
+                msg = getattr(gen, "message", None)
+                if msg is not None:
+                    rm = getattr(msg, "response_metadata", None) or {}
+                    model_name = rm.get("model_name") or rm.get("model")
+            model_name = model_name or "unknown"
 
             # Pull user context so entity classification and user fields are populated
             user_ctx = current_user_context.get()
@@ -101,12 +146,12 @@ def create_langchain_handler(telemetry: "TelemetryClient"):
             event = TelemetryEvent(
                 event_type="llm_call",
                 provider="openai",
-                model=llm_output.get("model_name", "unknown"),
+                model=model_name,
                 latency_ms=latency_ms,
                 output_message={"role": "assistant", "content": output_text},
-                prompt_tokens=usage.get("prompt_tokens"),
-                completion_tokens=usage.get("completion_tokens"),
-                total_tokens=usage.get("total_tokens"),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
                 # User context — required for entity classification
                 user_id=user_ctx.get("user_id"),
                 email=user_ctx.get("email"),
