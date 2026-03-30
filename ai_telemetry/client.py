@@ -153,7 +153,7 @@ class TelemetryClient:
 
         forced_entity = user_ctx.get("force_entity_type")
 
-        if event.event_type == "llm_call":
+        if event.event_type in ("llm_call", "user_message"):
             # Full classification — runs rules and updates session state
             prompt_text = user_ctx.get("prompt_text", "")
             if prompt_text:
@@ -168,9 +168,10 @@ class TelemetryClient:
                     prompt_text,
                     submission_ms,
                 )
-            # Caller may force entity type (e.g. requests routed through an AI agent pipeline)
-            # while still preserving all behavioral signals and alerts from the classifier.
-            if forced_entity:
+            # force_entity_type applies only to llm_call (agent pipeline calls).
+            # user_message events always use natural behavioral classification so
+            # the human turn is correctly identified as HUMAN/AUTOMATED/AGENT.
+            if event.event_type == "llm_call" and forced_entity:
                 event.entity_type = forced_entity
                 from ai_telemetry.session_state import get_session_store
                 store = get_session_store()

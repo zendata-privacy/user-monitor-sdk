@@ -24,6 +24,9 @@ dev        = ["pytest", "pytest-asyncio", "black", "mypy"]
 asyncio_mode = "auto"
 testpaths    = ["tests"]
 
+[tool.setuptools]
+editable-mode = "compat"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["ai_telemetry*"]

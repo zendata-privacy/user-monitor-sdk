@@ -368,7 +368,7 @@ def _vote_entity_type(signals: List[str]) -> Tuple[str, Optional[str]]:
         return "AGENT", None
     auto_votes = sum(1 for s in signals if s in _AUTOMATED_SIGNALS)
     human_votes = sum(1 for s in signals if s in _HUMAN_SIGNALS)
-    if auto_votes > 0 and auto_votes >= human_votes:
+    if auto_votes > 0 and auto_votes > human_votes:
         return "AUTOMATED", None
     if human_votes > 0:
         return "HUMAN", None
