@@ -3,7 +3,7 @@ AI Telemetry SDK for Python
 """
 
 from importlib.metadata import version as _metadata_version, PackageNotFoundError
-from typing import Optional
+from typing import Callable, List, Optional
 
 try:
     __version__ = _metadata_version("ai-telemetry-sdk")
@@ -13,6 +13,7 @@ except PackageNotFoundError:
 from ai_telemetry.client import TelemetryClient, TelemetryEvent
 from ai_telemetry.decorators import trace_llm, trace_tool
 from ai_telemetry.context import current_user_context, TraceContext
+from ai_telemetry.agent_fingerprint import get_fingerprint_store, AgentRecord
 
 _default_client: TelemetryClient | None = None
 
@@ -27,6 +28,7 @@ def init(
     debug: bool = False,
     enable_local_log: bool = False,
     log_path: Optional[str] = None,
+    embed_fn: Optional[Callable[[str], List[float]]] = None,
 ) -> TelemetryClient:
     """
     Initialize the AI Telemetry SDK.
@@ -39,6 +41,11 @@ def init(
         auto_patch_openai:   Automatically instrument the OpenAI SDK.
         auto_patch_anthropic: Automatically instrument the Anthropic SDK.
         debug:               Print debug logs to stdout.
+        embed_fn:            Optional callable ``(text: str) -> List[float]`` that
+                             returns a 768-dim embedding vector.  When provided,
+                             the SDK will populate ``system_prompt_embedding`` on
+                             every LLM call event for agent similarity clustering
+                             and version-drift detection (Module 1).
 
     Returns:
         TelemetryClient instance (also set as the module-level default).
@@ -46,11 +53,15 @@ def init(
     Example::
 
         import ai_telemetry as telemetry
+        from sentence_transformers import SentenceTransformer
+
+        model = SentenceTransformer("all-mpnet-base-v2")
 
         telemetry.init(
             app_id="my-ai-app",
             api_key="sk-telem-...",
             auto_patch_openai=True,
+            embed_fn=lambda text: model.encode(text).tolist(),
         )
     """
     global _default_client
@@ -63,6 +74,7 @@ def init(
         debug=debug,
         enable_local_log=enable_local_log,
         log_path=log_path,
+        embed_fn=embed_fn,
     )
     _default_client = client
 
@@ -96,4 +108,6 @@ __all__ = [
     "TraceContext",
     "trace_llm",
     "trace_tool",
+    "get_fingerprint_store",
+    "AgentRecord",
 ]

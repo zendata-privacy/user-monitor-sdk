@@ -37,6 +37,9 @@ class SessionState:
     role_play_count: int = 0
     # D4: sensitivity score per turn (float 0–10); used to detect escalating probes
     probe_scores: List[float] = field(default_factory=list)
+    # Module 2 — continuous caller_type score (0.0 = definite agent, 1.0 = definite human)
+    # Maintained as an exponential moving average across turns; resolves in 3–5 calls.
+    caller_type_score: float = 0.5
 
 
 @dataclass

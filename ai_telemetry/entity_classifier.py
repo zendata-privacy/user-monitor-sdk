@@ -6,15 +6,33 @@ directly onto the TelemetryEvent passed in.
 
 Categories
 ----------
-  1  Timing & Latency    T1  T2  T3
-  2  Prompt Structure    P1  P4
-  3  Session Behavior    S1  S4
-  4  API Access Patterns A1  A2
-  5  Multi-Agent Topology M1
-  6  Behavioral Drift    D1  D2  D3  D4  D5
+  1  Timing & Latency      T1  T2  T3  T5  T6
+  2  Prompt Structure      P1  P4
+  3  Session Behavior      S1  S2  S4
+  4  API Access Patterns   A1  A2
+  5  Multi-Agent Topology  M1
+  6  Behavioral Drift      D1  D2  D3  D4  D5
+  7  Temporal Context      B1
+
+Scoring
+-------
+Every rule emits a named signal.  Each signal carries a weight that pushes
+the ``caller_type_score`` toward 0.0 (definite agent) or 1.0 (definite human).
+Weights are defined in ``_SIGNAL_WEIGHTS``.
+
+Per-turn score = 0.5 + Σ(weights of signals fired this turn), clamped [0, 1].
+Session score  = EMA(per_turn_score, alpha=0.4) — recent turns count more.
+
+Thresholds (spec §Module 2):
+  score < 0.25          → AUTOMATED or AGENT (see M1 flag)
+  0.25 ≤ score ≤ 0.75  → AMBIGUOUS  (re-evaluated each call)
+  score > 0.75          → HUMAN
+
+Most callers resolve in 3–5 calls.
 """
 
 import re
+from datetime import datetime, timezone
 from typing import List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -77,6 +95,31 @@ _RE_SPECIFICITY = re.compile(
     re.IGNORECASE,
 )
 
+# T5 — Human writing artifacts: typos, self-corrections, informal language
+_RE_TYPO_CORRECTION = re.compile(
+    r"\b(wait[,\s]+i meant|i meant to (say|type|write)|oops[,!\s]|my bad"
+    r"|typo[,\s]|sorry[,\s]+(i meant|let me|i was)|lol\b|gonna\b|wanna\b"
+    r"|dunno\b|kinda\b|sorta\b|nvm\b|idk\b|tbh\b|imo\b|fyi\b|btw\b"
+    r"|thx\b|pls\b|tho\b|rn\b|irl\b)\b"
+    r"|\*correction\*|\*edit\*|\*update\*"
+    r"|\.{3,}",   # overuse of ellipsis is a human writing artifact
+    re.IGNORECASE,
+)
+
+# S2 — Session continuity: references to prior turns / pronoun resolution
+_RE_CONTINUITY = re.compile(
+    r"\b(you (just |previously |earlier )?(said|mentioned|told me|suggested|recommended)"
+    r"|as (you |we )?(said|mentioned|discussed|talked about)"
+    r"|earlier (you|we|i)|the (previous|last) (message|response|answer|question|point)"
+    r"|going back to|referring to|what (i|you) (said|meant|asked)"
+    r"|like (i|you) (mentioned|said|asked)|that (thing|point|option|idea) (you|i)"
+    r"|from (before|earlier)|following up (on)?|as (we |i |you )?discussed"
+    r"|as (we |i |you )?mentioned|you (remember|recall)|i (remember|recall)"
+    r"|to clarify (what|that)|building on (that|what)|in addition to (what|that)"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Category 1 — Timing & Latency
@@ -135,6 +178,30 @@ def _check_T3(prompt_text: str, inter_turn_ms: int) -> List[str]:
     return ["T3_TYPING_SPEED"] if cps > 15 else []
 
 
+def _check_T5(prompt_text: str) -> List[str]:
+    """T5 — Typos, self-corrections, and informal language (HIGH human).
+
+    Human writing artifacts: conversational repair ('wait I meant'), informal
+    contractions (gonna, wanna), filler abbreviations (idk, lol), and
+    overuse of ellipsis.  These patterns are virtually absent in programmatic
+    prompt generation.
+    """
+    return ["T5_TYPO_CORRECTION"] if _RE_TYPO_CORRECTION.search(prompt_text) else []
+
+
+def _check_T6(inter_turn_ms: int) -> List[str]:
+    """T6 — Human reading/typing latency band (HIGH human).
+
+    5 000–60 000 ms between the last response and this submission is
+    consistent with a human reading the reply and composing a response.
+    Sub-5 s favours automation; above 60 s may indicate the user stepped
+    away (ambiguous), so we only assert human in this window.
+    """
+    if inter_turn_ms <= 0:
+        return []
+    return ["T6_HUMAN_LATENCY_BAND"] if 5_000 <= inter_turn_ms <= 60_000 else []
+
+
 # ---------------------------------------------------------------------------
 # Category 2 — Prompt Structure
 # ---------------------------------------------------------------------------
@@ -191,6 +258,19 @@ def _check_S1(prompt_text: str, state: "SessionState") -> List[str]:
     return []
 
 
+def _check_S2(prompt_text: str, state: "SessionState") -> List[str]:
+    """S2 — Session continuity / pronoun resolution (HIGH human).
+
+    References to previous messages ('you mentioned', 'as we discussed',
+    'earlier you said') require the caller to maintain context across turns.
+    Pipelines and stateless agents do not naturally produce these phrases.
+    Only checked from turn 1 onwards (first turn has no prior context).
+    """
+    if not state.turns:
+        return []
+    return ["S2_SESSION_CONTINUITY"] if _RE_CONTINUITY.search(prompt_text) else []
+
+
 def _check_S4(store: "SessionStore", entity_key: str) -> List[str]:
     """S4 — Simultaneous sessions.
 
@@ -226,6 +306,24 @@ def _check_A2(store: "SessionStore", entity_key: str, now_ms: int) -> List[str]:
     window_start = now_ms - 10_000
     burst = sum(1 for t in store.get_call_timestamps(entity_key) if t >= window_start)
     return ["A2_BURST_CALLS"] if burst > 5 else []
+
+
+# ---------------------------------------------------------------------------
+# Category 7 — Temporal Context
+# ---------------------------------------------------------------------------
+
+def _check_B1(submission_ms: int) -> List[str]:
+    """B1 — Business hours clustering (MEDIUM human).
+
+    Human callers concentrate in working hours; batch pipelines and agents
+    run at any hour.  A call arriving Mon–Fri 08:00–19:00 UTC leans human.
+    This signal is MEDIUM weight — it confirms but cannot override strong
+    timing signals pointing the other way.
+    """
+    dt = datetime.fromtimestamp(submission_ms / 1000.0, tz=timezone.utc)
+    if dt.weekday() < 5 and 8 <= dt.hour < 19:  # Mon=0 … Fri=4
+        return ["B1_BUSINESS_HOURS"]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -328,51 +426,85 @@ def _check_D5(prompt_text: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Signal → entity type voting
+# Signal weights — continuous caller_type scoring (Module 2)
 # ---------------------------------------------------------------------------
+# Each signal carries a weight in (-1, +1).
+# Negative weights push the score toward 0.0 (agent).
+# Positive weights push the score toward 1.0 (human).
+# Magnitude: HIGH ≈ ±0.25, MEDIUM ≈ ±0.12.
 
-_AUTOMATED_SIGNALS = frozenset({
-    "T1_SUBMISSION_VELOCITY", "T2_LOW_LATENCY_VARIANCE", "T3_TYPING_SPEED",
-    "P1_TEMPLATE_STRUCTURE", "P4_IMPERATIVE_FRAMING",
-    "S1_WARMUP_ABSENT", "S4_SIMULTANEOUS_SESSIONS",
-    "A1_HIGH_CALL_VOLUME", "A2_BURST_CALLS",
-})
-
-_HUMAN_SIGNALS = frozenset({
-    "T2_HIGH_LATENCY_VARIANCE",
-    "A1_LOW_CALL_VOLUME",
-})
-
-_AGENT_SIGNALS = frozenset({
-    "M1_DELEGATION_LANGUAGE",
-})
-
-# Signals that produce alerts rather than entity-type votes
-_ALERT_MAP = {
-    "D1_BASELINE_DRIFT":    "DRIFT_ALERT",
-    "D2_TAKEOVER_ALERT":    "TAKEOVER_ALERT",
-    "D3_ROLE_PLAY_INJECTION": "ROLE_PLAY_INJECTION",
-    "D4_PROGRESSIVE_PROBE": "PROGRESSIVE_PROBE",
-    "D5_REGULATORY_PROBE":  "REGULATORY_PROBE",
+_SIGNAL_WEIGHTS: dict = {
+    # --- Agent signals (negative) ---
+    "T1_SUBMISSION_VELOCITY":   -0.25,  # HIGH  — sub-500 ms latency
+    "T2_LOW_LATENCY_VARIANCE":  -0.25,  # HIGH  — clock-like regularity
+    "T3_TYPING_SPEED":          -0.25,  # HIGH  — >15 chars/sec
+    "M1_DELEGATION_LANGUAGE":   -0.30,  # HIGH  — orchestration phrases
+    "S1_WARMUP_ABSENT":         -0.12,  # MEDIUM — no warm-up / stateless
+    "P1_TEMPLATE_STRUCTURE":    -0.12,  # MEDIUM — repeating template
+    "P4_IMPERATIVE_FRAMING":    -0.12,  # MEDIUM — command framing
+    "S4_SIMULTANEOUS_SESSIONS": -0.25,  # HIGH  — parallel sessions same key
+    "A1_HIGH_CALL_VOLUME":      -0.12,  # MEDIUM — >1 000 calls/24 h
+    "A2_BURST_CALLS":           -0.12,  # MEDIUM — >5 calls/10 s
+    # --- Human signals (positive) ---
+    "T5_TYPO_CORRECTION":       +0.25,  # HIGH  — informal / repair language
+    "T6_HUMAN_LATENCY_BAND":    +0.25,  # HIGH  — 5–60 s response window
+    "S2_SESSION_CONTINUITY":    +0.25,  # HIGH  — refers to prior turns
+    "B1_BUSINESS_HOURS":        +0.12,  # MEDIUM — Mon–Fri 08:00–19:00 UTC
+    "T2_HIGH_LATENCY_VARIANCE": +0.20,  # existing — high stddev across turns
+    "A1_LOW_CALL_VOLUME":       +0.12,  # existing — <20 calls/24 h
 }
 
+# Signals that produce behavioral alerts rather than classification votes
+_ALERT_MAP = {
+    "D1_BASELINE_DRIFT":      "DRIFT_ALERT",
+    "D2_TAKEOVER_ALERT":      "TAKEOVER_ALERT",
+    "D3_ROLE_PLAY_INJECTION": "ROLE_PLAY_INJECTION",
+    "D4_PROGRESSIVE_PROBE":   "PROGRESSIVE_PROBE",
+    "D5_REGULATORY_PROBE":    "REGULATORY_PROBE",
+}
 
-def _vote_entity_type(signals: List[str]) -> Tuple[str, Optional[str]]:
-    """
-    Vote on entity type from collected signals.
+# EMA smoothing factor: 0.4 weights the current turn, 0.6 retains session history.
+# A caller typically resolves (exits AMBIGUOUS) after 3–5 turns.
+_EMA_ALPHA = 0.4
 
-    Returns (entity_type, entity_subtype).
-    AGENT always wins if M1 is present (multi-agent topology is definitive).
+# Spec thresholds
+_THRESHOLD_AGENT  = 0.25
+_THRESHOLD_HUMAN  = 0.75
+
+
+def _compute_caller_type(
+    signals: List[str],
+    session_score: float,
+    m1_subtype: Optional[str],
+) -> Tuple[float, str, Optional[str]]:
+    """Compute the updated session caller_type_score and derive entity_type.
+
+    Returns (new_session_score, entity_type, entity_subtype).
+
+    Algorithm
+    ---------
+    1. Per-turn score = 0.5 + Σ(signal weights for this turn), clamped [0, 1].
+    2. EMA update: session_score = α·per_turn + (1-α)·session_score.
+    3. Entity type from thresholds; M1 overrides < 0.25 → AGENT vs AUTOMATED.
     """
-    if any(s in _AGENT_SIGNALS for s in signals):
-        return "AGENT", None
-    auto_votes = sum(1 for s in signals if s in _AUTOMATED_SIGNALS)
-    human_votes = sum(1 for s in signals if s in _HUMAN_SIGNALS)
-    if auto_votes > 0 and auto_votes > human_votes:
-        return "AUTOMATED", None
-    if human_votes > 0:
-        return "HUMAN", None
-    return "UNKNOWN", None
+    per_turn_delta = sum(_SIGNAL_WEIGHTS.get(s, 0.0) for s in signals)
+    per_turn_score = max(0.0, min(1.0, 0.5 + per_turn_delta))
+
+    new_score = _EMA_ALPHA * per_turn_score + (1.0 - _EMA_ALPHA) * session_score
+    new_score = max(0.0, min(1.0, new_score))
+
+    if new_score < _THRESHOLD_AGENT:
+        # M1 delegation language distinguishes AGENT from AUTOMATED
+        entity_type = "AGENT" if "M1_DELEGATION_LANGUAGE" in signals else "AUTOMATED"
+        entity_subtype = m1_subtype
+    elif new_score > _THRESHOLD_HUMAN:
+        entity_type = "HUMAN"
+        entity_subtype = None
+    else:
+        entity_type = "AMBIGUOUS"
+        entity_subtype = m1_subtype  # retain subtype if already known
+
+    return new_score, entity_type, entity_subtype
 
 
 # ---------------------------------------------------------------------------
@@ -416,30 +548,34 @@ def classify_event(
     # ----------------------------------------------------------------
     all_signals: List[str] = []
 
-    # Category 1
+    # Category 1 — Timing & Latency
     all_signals += _check_T1(state, submission_ms)
     all_signals += _check_T2(state)
     if inter_turn_ms > 0:
         all_signals += _check_T3(prompt_text, inter_turn_ms)
+        all_signals += _check_T6(inter_turn_ms)      # NEW: human latency band
+    all_signals += _check_T5(prompt_text)             # NEW: typos/corrections
 
-    # Category 2
+    # Category 2 — Prompt Structure
     all_signals += _check_P1(state, prompt_text)
     all_signals += _check_P4(prompt_text)
 
-    # Category 3
+    # Category 3 — Session Behavior
     all_signals += _check_S1(prompt_text, state)
+    all_signals += _check_S2(prompt_text, state)      # NEW: session continuity
     all_signals += _check_S4(store, entity_key)
 
-    # Category 4
+    # Category 4 — API & Access Patterns
     all_signals += _check_A1(store, entity_key)
     all_signals += _check_A2(store, entity_key, now_ms)
 
-    # Category 5
+    # Category 5 — Multi-Agent Topology
     m1_signals, m1_subtype = _check_M1(prompt_text, turn_index)
     all_signals += m1_signals
 
-    # Category 6 — use sailpoint_risk as the current risk score (composite
-    # risk is not yet available at capture time; it's assigned later in _send)
+    # Category 6 — Behavioral Drift
+    # Use sailpoint_risk as the current risk score; composite risk is
+    # assigned later in _send() and not yet available at capture time.
     current_risk = 0.0
     try:
         current_risk = float(event.sailpoint_risk or 0)
@@ -452,22 +588,29 @@ def classify_event(
     all_signals += _check_D4(state, prompt_text)
     all_signals += _check_D5(prompt_text)
 
-    # ----------------------------------------------------------------
-    # Determine entity type
-    # ----------------------------------------------------------------
-    entity_type, _ = _vote_entity_type(all_signals)
-    entity_subtype: Optional[str] = m1_subtype
-
-    # Preserve an established non-UNKNOWN classification if no new signals fired
-    if entity_type == "UNKNOWN" and state.entity_type != "UNKNOWN":
-        entity_type = state.entity_type
-        entity_subtype = state.entity_subtype
+    # Category 7 — Temporal Context
+    all_signals += _check_B1(submission_ms)           # NEW: business hours
 
     # ----------------------------------------------------------------
     # Separate classification signals from behavioral alerts
     # ----------------------------------------------------------------
     alerts = [_ALERT_MAP[s] for s in all_signals if s in _ALERT_MAP]
     classification_signals = [s for s in all_signals if s not in _ALERT_MAP]
+
+    # ----------------------------------------------------------------
+    # Continuous caller_type scoring (Module 2)
+    # ----------------------------------------------------------------
+    new_score, entity_type, entity_subtype = _compute_caller_type(
+        classification_signals,
+        state.caller_type_score,
+        m1_subtype,
+    )
+
+    # If AMBIGUOUS and session has a more definitive prior classification,
+    # preserve it (don't regress to AMBIGUOUS on a signal-quiet turn).
+    if entity_type == "AMBIGUOUS" and state.entity_type not in ("UNKNOWN", "AMBIGUOUS"):
+        entity_type = state.entity_type
+        entity_subtype = state.entity_subtype or entity_subtype
 
     # ----------------------------------------------------------------
     # Update session state
@@ -482,6 +625,7 @@ def classify_event(
         response_time_ms=now_ms,
     )
     state.turns.append(turn)
+    state.caller_type_score = new_score
     state.entity_type = entity_type
     if entity_subtype:
         state.entity_subtype = entity_subtype
@@ -499,10 +643,27 @@ def classify_event(
     store.update_session(state)
 
     # ----------------------------------------------------------------
+    # Module 4 — human role evidence accumulation
+    # Accumulate regardless of current classification; emit role only
+    # when entity_type is confirmed HUMAN so no evidence is lost during
+    # the AMBIGUOUS resolution window.
+    # ----------------------------------------------------------------
+    from ai_telemetry.role_inference import update_human_role, get_human_role
+    update_human_role(entity_key, session_id, prompt_text)
+    if entity_type == "HUMAN":
+        human_role, human_conf = get_human_role(entity_key)
+        event.human_inferred_role = human_role
+        event.human_role_confidence = round(human_conf, 4) if human_conf else None
+    else:
+        event.human_inferred_role = None
+        event.human_role_confidence = None
+
+    # ----------------------------------------------------------------
     # Annotate the event
     # ----------------------------------------------------------------
     event.entity_type = entity_type
     event.entity_subtype = entity_subtype
+    event.caller_type_score = round(new_score, 4)
     event.classification_signals = "|".join(classification_signals) if classification_signals else None
     event.behavioral_alerts = "|".join(alerts) if alerts else None
     event.session_turn_index = turn_index

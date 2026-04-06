@@ -4,6 +4,7 @@ Sends telemetry events to your configured endpoint.
 """
 
 import atexit
+import hashlib
 import time
 import uuid
 import threading
@@ -15,8 +16,38 @@ import os
 import csv
 import tempfile
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Callable, Optional, Dict, Any, List
 from dataclasses import dataclass, field, asdict
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers (used by integrations too)
+# ---------------------------------------------------------------------------
+
+def _sha256(text: str) -> str:
+    """Return the lowercase hex SHA-256 digest of *text*."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+_SENSITIVE_HEADERS = frozenset({
+    "authorization", "cookie", "set-cookie", "x-api-key",
+    "x-auth-token", "proxy-authorization", "www-authenticate",
+})
+
+
+def _digest_http_headers(headers: Dict[str, str]) -> str:
+    """Return a SHA-256 digest of non-sensitive HTTP headers for client fingerprinting.
+
+    Sensitive credential/session headers are excluded before hashing so the
+    digest can safely be stored and compared without exposing secrets.
+    """
+    filtered = {
+        k.lower(): v
+        for k, v in headers.items()
+        if k.lower() not in _SENSITIVE_HEADERS
+    }
+    canonical = json.dumps(filtered, sort_keys=True, separators=(",", ":"))
+    return _sha256(canonical)
 
 
 @dataclass
@@ -67,6 +98,38 @@ class TelemetryEvent:
     span_id: Optional[str] = None
     parent_span_id: Optional[str] = None
 
+    # Module 2 — Human vs. Non-Human Classification
+    caller_type_score: Optional[float] = None  # 0.0 (definite agent) → 1.0 (definite human); resolves in 3-5 calls
+
+    # Module 5 — Behavioral Drift Detection
+    drift_score: Optional[float] = None              # aggregate 0.0–1.0
+    drift_classification: Optional[str] = None       # STABLE | MONITOR | INVESTIGATE | WARNING | CRITICAL
+    drift_signals: Optional[str] = None              # pipe-delimited alert names from all components
+    zasp_score: Optional[float] = None               # derived ZASP safety score (0–10, higher = safer)
+
+    # Module 4 — Dynamic Role Inference
+    human_inferred_role: Optional[str] = None       # ENGINEER | FINANCE | HR | COMPLIANCE | CUSTOMER_SERVICE | SECURITY | EXECUTIVE
+    human_role_confidence: Optional[float] = None   # 0.0–1.0; emitted only for HUMAN entity_type
+    agent_role: Optional[str] = None                # CS_AGENT | FINANCE_AGENT | ORCHESTRATOR | DATA_ANALYST | … (9-role taxonomy)
+    agent_risk_level: Optional[str] = None          # CRITICAL | HIGH | MEDIUM | LOW-MED | LOW
+    agent_primary_risk: Optional[str] = None        # human-readable risk description
+    role_scope_gap: Optional[bool] = None           # True when observed tool scope diverges from stated agent role
+
+    # Module 3 — Agent Fingerprinting
+    agent_id: Optional[str] = None                      # pseudonymous stable ID (agt_<api_key_hash[:20]>)
+    agent_display_name: Optional[str] = None            # inferred from "You are X" in system prompt
+    agent_inferred_type: Optional[str] = None           # NIGHTLY_BATCH | REALTIME | HIGH_FREQUENCY_PIPELINE | BUSINESS_HOURS_AGENT
+    orchestration_role: Optional[str] = None            # ORCHESTRATOR | SUBAGENT | STANDALONE
+    prompt_template_hash: Optional[str] = None          # 16-char structural hash for cross-session template matching
+    system_prompt_version_count: Optional[int] = None   # number of distinct system prompt versions observed
+
+    # Module 1 — Signal Capture (fields added to complete the spec)
+    api_key_hash: Optional[str] = None             # SHA-256 of caller's API key; enables clustering without credential exposure
+    system_prompt_hash: Optional[str] = None       # SHA-256 of system prompt; enables agent versioning and lineage tracking
+    system_prompt_embedding: Optional[List[float]] = None  # 768-dim embedding for agent similarity clustering / version drift
+    ip_hash: Optional[str] = None                  # SHA-256 of source IP; enables geographic clustering without raw storage
+    http_headers_digest: Optional[str] = None      # SHA-256 digest of non-sensitive HTTP headers for client fingerprinting
+
     # Entity classification (populated by entity_classifier)
     entity_type: Optional[str] = None              # HUMAN | AUTOMATED | AGENT | UNKNOWN
     entity_subtype: Optional[str] = None           # SUBAGENT_RECEIVER | ORCHESTRATOR_SENDER
@@ -103,6 +166,7 @@ class TelemetryClient:
         debug: bool = False,
         enable_local_log: bool = False,
         log_path: Optional[str] = None,
+        embed_fn: Optional[Callable[[str], List[float]]] = None,
     ):
         self.app_id = app_id
         self.api_key = api_key
@@ -112,6 +176,9 @@ class TelemetryClient:
         self.capture_prompts = capture_prompts
         self.debug = debug
         self.enable_local_log = enable_local_log
+        self.embed_fn = embed_fn  # optional callable: str -> List[float] (e.g. 768-dim sentence embedding)
+        # Pre-compute the API-key hash once so every event gets it for free
+        self._api_key_hash: Optional[str] = _sha256(api_key) if api_key else None
         self.log_path = log_path or os.path.join(
             os.environ.get("ZENDATA_LOG_DIR", os.path.join(tempfile.gettempdir(), "zendata")),
             "events.csv",
@@ -135,6 +202,11 @@ class TelemetryClient:
         """Enqueue a telemetry event (non-blocking)."""
         event.app_id = self.app_id
 
+        # --- Module 1: always-on signal fields --------------------------------
+        # api_key_hash: attach unless the caller has already set it
+        if not event.api_key_hash:
+            event.api_key_hash = self._api_key_hash
+
         # Auto-populate trace context from context vars if not explicitly set on the event
         from ai_telemetry.context import _current_trace_id, _current_span_id, current_user_context
         if not event.trace_id:
@@ -150,6 +222,20 @@ class TelemetryClient:
         user_ctx = current_user_context.get()
         entity_key = user_ctx.get("user_id") or "unknown"
         session_id = event.trace_id or entity_key
+
+        # --- Module 1: ip_hash and http_headers_digest from request context ----
+        # The host application sets "ip_address" and/or "http_headers" in
+        # current_user_context (e.g. from a FastAPI/Flask middleware).  The SDK
+        # hashes them here so raw values are never persisted.
+        if not event.ip_hash:
+            ip = user_ctx.get("ip_address")
+            if ip:
+                event.ip_hash = _sha256(str(ip))
+
+        if not event.http_headers_digest:
+            headers = user_ctx.get("http_headers")
+            if isinstance(headers, dict) and headers:
+                event.http_headers_digest = _digest_http_headers(headers)
 
         forced_entity = user_ctx.get("force_entity_type")
 
@@ -229,9 +315,56 @@ class TelemetryClient:
     def _send(self, events: List[TelemetryEvent]):
         # Zendata evaluation runs here, on the background thread (never on the caller's thread)
         from ai_telemetry.integrations.zendata_integration import evaluate_event
+        from ai_telemetry.agent_fingerprint import fingerprint_agent, get_fingerprint_store
+        from ai_telemetry.drift_detector import analyze_drift, derive_zasp_score
         for event in events:
             if event.event_type == "llm_call":
                 evaluate_event(event)
+                # Module 3 — build/update agent fingerprint for non-human callers
+                if event.entity_type in ("AUTOMATED", "AGENT", "AMBIGUOUS"):
+                    try:
+                        fingerprint_agent(event)
+                    except Exception as ex:
+                        if self.debug:
+                            print(f"[AI Telemetry] Agent fingerprinting error (non-fatal): {ex}")
+
+                    # Module 5 — behavioral drift detection
+                    if event.agent_id:
+                        try:
+                            # Derive ZASP safety score and attach to event
+                            zasp = derive_zasp_score(event)
+                            event.zasp_score = zasp
+
+                            # Gather cluster means from agents with the same role
+                            fp_store = get_fingerprint_store()
+                            from ai_telemetry.drift_detector import get_drift_store
+                            drift_store = get_drift_store()
+                            cluster_means = []
+                            if event.agent_role:
+                                for rec in fp_store.all_records():
+                                    if rec.agent_id == event.agent_id:
+                                        continue
+                                    if rec.agent_role != event.agent_role:
+                                        continue
+                                    peer_b = drift_store.get_or_create(rec.agent_id)
+                                    if peer_b.recent_safety_scores:
+                                        cluster_means.append(
+                                            sum(peer_b.recent_safety_scores) / len(peer_b.recent_safety_scores)
+                                        )
+
+                            tool_scope = list(
+                                fp_store.get(event.agent_id).tool_scope
+                                if fp_store.get(event.agent_id) else []
+                            )
+                            drift_score, drift_class, drift_alerts = analyze_drift(
+                                event, event.agent_id, tool_scope, cluster_means
+                            )
+                            event.drift_score = drift_score
+                            event.drift_classification = drift_class
+                            event.drift_signals = "|".join(drift_alerts) if drift_alerts else None
+                        except Exception as ex:
+                            if self.debug:
+                                print(f"[AI Telemetry] Drift detection error (non-fatal): {ex}")
 
         # HTTP first — primary delivery path
         self._send_http(events)
@@ -326,6 +459,18 @@ class TelemetryClient:
             "zendata_composite_risk", "zendata_classification", "data_sources", "tools_called",
             "entity_type", "entity_subtype", "classification_signals", "behavioral_alerts",
             "session_turn_index", "inter_turn_latency_ms",
+            # Module 1 — Signal Capture additions
+            "api_key_hash", "system_prompt_hash", "ip_hash", "http_headers_digest",
+            # Module 2 — Human vs. Non-Human Classification
+            "caller_type_score",
+            # Module 3 — Agent Fingerprinting
+            "agent_id", "agent_display_name", "agent_inferred_type",
+            "orchestration_role", "prompt_template_hash", "system_prompt_version_count",
+            # Module 4 — Dynamic Role Inference
+            "human_inferred_role", "human_role_confidence",
+            "agent_role", "agent_risk_level", "agent_primary_risk", "role_scope_gap",
+            # Module 5 — Behavioral Drift Detection
+            "zasp_score", "drift_score", "drift_classification", "drift_signals",
         ]
 
         log_file = self.log_path
@@ -371,6 +516,33 @@ class TelemetryClient:
                     "behavioral_alerts": e.behavioral_alerts or "",
                     "session_turn_index": e.session_turn_index if e.session_turn_index is not None else "",
                     "inter_turn_latency_ms": e.inter_turn_latency_ms if e.inter_turn_latency_ms is not None else "",
+                    # Module 1 additions
+                    "api_key_hash": e.api_key_hash or "",
+                    "system_prompt_hash": e.system_prompt_hash or "",
+                    "ip_hash": e.ip_hash or "",
+                    "http_headers_digest": e.http_headers_digest or "",
+                    # Module 2 addition
+                    "caller_type_score": e.caller_type_score if e.caller_type_score is not None else "",
+                    # Module 3 additions
+                    "agent_id": e.agent_id or "",
+                    "agent_display_name": e.agent_display_name or "",
+                    "agent_inferred_type": e.agent_inferred_type or "",
+                    "orchestration_role": e.orchestration_role or "",
+                    "prompt_template_hash": e.prompt_template_hash or "",
+                    "system_prompt_version_count": e.system_prompt_version_count if e.system_prompt_version_count is not None else "",
+                    # Module 5 additions
+                    "zasp_score": e.zasp_score if e.zasp_score is not None else "",
+                    "drift_score": e.drift_score if e.drift_score is not None else "",
+                    "drift_classification": e.drift_classification or "",
+                    "drift_signals": e.drift_signals or "",
+                    # Module 4 additions
+                    "human_inferred_role": e.human_inferred_role or "",
+                    "human_role_confidence": e.human_role_confidence if e.human_role_confidence is not None else "",
+                    "agent_role": e.agent_role or "",
+                    "agent_risk_level": e.agent_risk_level or "",
+                    "agent_primary_risk": e.agent_primary_risk or "",
+                    "role_scope_gap": e.role_scope_gap if e.role_scope_gap is not None else "",
+                    # system_prompt_embedding is omitted from CSV (float[] — stored in JSONL only)
                 }
                 meta = e.metadata or {}
                 for k, v in meta.items():

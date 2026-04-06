@@ -15,6 +15,27 @@ if TYPE_CHECKING:
     from ai_telemetry.client import TelemetryClient
 
 
+def _capture_system_prompt_fields(event, messages, telemetry) -> None:
+    """Populate system_prompt_hash and system_prompt_embedding on *event*.
+
+    Iterates the OpenAI-style messages list looking for a role="system" entry.
+    Safe to call even when messages is empty or None.
+    """
+    from ai_telemetry.client import _sha256
+    system_text = next(
+        (m.get("content", "") for m in (messages or []) if m.get("role") == "system"),
+        None,
+    )
+    if not system_text:
+        return
+    event.system_prompt_hash = _sha256(system_text)
+    if telemetry.embed_fn:
+        try:
+            event.system_prompt_embedding = telemetry.embed_fn(system_text)
+        except Exception:
+            pass  # embedding is best-effort; never block telemetry
+
+
 def patch_openai(telemetry: "TelemetryClient"):
     """
     Patches openai.OpenAI and openai.AsyncOpenAI so every
@@ -56,6 +77,8 @@ def patch_openai(telemetry: "TelemetryClient"):
                 input_messages=list(messages),
                 **error_info,
             )
+
+            _capture_system_prompt_fields(event, messages, telemetry)
 
             if response is not None:
                 choice = response.choices[0] if response.choices else None
@@ -115,6 +138,8 @@ def patch_openai(telemetry: "TelemetryClient"):
                 input_messages=list(messages),
                 **error_info,
             )
+
+            _capture_system_prompt_fields(event, messages, telemetry)
 
             if response is not None:
                 choice = response.choices[0] if response.choices else None

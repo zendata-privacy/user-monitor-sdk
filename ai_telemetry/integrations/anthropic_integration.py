@@ -15,6 +15,33 @@ if TYPE_CHECKING:
     from ai_telemetry.client import TelemetryClient
 
 
+def _capture_system_prompt_fields(event, kwargs, telemetry) -> None:
+    """Populate system_prompt_hash and system_prompt_embedding on *event*.
+
+    Anthropic passes the system prompt as a top-level ``system`` kwarg (string).
+    Some callers also embed a role="system" entry in the messages list; both
+    patterns are checked so no context is missed.
+    """
+    from ai_telemetry.client import _sha256
+    # Anthropic-native: system= kwarg
+    system_text = kwargs.get("system") or ""
+    # Fallback: OpenAI-style role="system" in messages list
+    if not system_text:
+        messages = kwargs.get("messages", [])
+        system_text = next(
+            (m.get("content", "") for m in messages if m.get("role") == "system"),
+            "",
+        )
+    if not system_text:
+        return
+    event.system_prompt_hash = _sha256(system_text)
+    if telemetry.embed_fn:
+        try:
+            event.system_prompt_embedding = telemetry.embed_fn(system_text)
+        except Exception:
+            pass  # best-effort; never block telemetry
+
+
 def patch_anthropic(telemetry: "TelemetryClient"):
     """
     Patches anthropic.resources.messages.Messages.create so every
@@ -56,6 +83,8 @@ def patch_anthropic(telemetry: "TelemetryClient"):
                 input_messages=list(messages),
                 **error_info,
             )
+
+            _capture_system_prompt_fields(event, kwargs, telemetry)
 
             if response is not None:
                 # Extract text and tool_use blocks
@@ -113,6 +142,8 @@ def patch_anthropic(telemetry: "TelemetryClient"):
                 input_messages=list(messages),
                 **error_info,
             )
+
+            _capture_system_prompt_fields(event, kwargs, telemetry)
 
             if response is not None:
                 text_blocks = [b for b in response.content if b.type == "text"]
