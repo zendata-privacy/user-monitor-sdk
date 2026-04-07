@@ -435,12 +435,17 @@ def _assess_requirement(
                 )
         else:
             status = "SATISFIED"
+            refusal_str = (
+                f"{baseline.baseline_refusal_rate:.1%}"
+                if baseline.baseline_refusal_rate is not None
+                else "not yet computed"
+            )
             rationale = (
                 f"Full SR 11-7 ongoing monitoring active ({calls} calls). "
                 "Safety score drift and refusal rate change directly implement "
                 "SR 11-7 behavioral monitoring requirements. "
                 f"Validated baseline: ZASP mean {evidence['baseline_safety_mean']}, "
-                f"refusal rate {baseline.baseline_refusal_rate:.1%}."
+                f"refusal rate {refusal_str}."
             )
 
     # ---- NIST MEASURE 2.7 ----
@@ -528,9 +533,14 @@ def _assess_requirement(
                 )
         else:
             status = "SATISFIED"
+            refusal_str = (
+                f"{baseline.baseline_refusal_rate:.1%}"
+                if baseline.baseline_refusal_rate is not None
+                else "not yet computed"
+            )
             rationale = (
                 "Full FFIEC behavioral monitoring program active. "
-                f"Refusal rate baseline: {baseline.baseline_refusal_rate:.1%} "
+                f"Refusal rate baseline: {refusal_str} "
                 "(degradation-detection active). "
                 f"Tool scope: {new_tools} new tool(s) flagged post-baseline. "
                 "Safety score drift monitoring satisfies FFIEC ongoing monitoring requirement."
