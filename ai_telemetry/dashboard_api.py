@@ -353,46 +353,42 @@ def iam_enrichment_status() -> Dict:
 
 
 # ---------------------------------------------------------------------------
-# Panel: Agent Topology (placeholder — extended in Module 8)
+# Panel: Agent Topology — Module 8 (full implementation)
 # ---------------------------------------------------------------------------
 
-def agent_topology() -> Dict:
-    """Directed graph of agent relationships inferred from orchestration roles."""
+def agent_topology(events: Optional[List[Dict]] = None) -> Dict:
+    """Directed graph of agent relationships with authority scores.
+
+    Delegates to topology_mapper (Module 8) for full kill-chain analysis.
+    Pass pre-loaded event dicts to enable session-cooccurrence and
+    API-key-sequence edge inference.
+    """
+    try:
+        from ai_telemetry.topology_mapper import get_topology_risk_report
+        return get_topology_risk_report(events=events)
+    except ImportError:
+        pass
+
+    # Fallback: basic orchestration-only graph (pre-Module-8 behaviour)
     from ai_telemetry.agent_fingerprint import get_fingerprint_store
-
     fp_store = get_fingerprint_store()
-    records = fp_store.all_records()
-
-    nodes = []
-    edges = []
-
+    records  = fp_store.all_records()
+    nodes    = []
+    edges    = []
     orchestrators = [r for r in records if r.orchestration_role == "ORCHESTRATOR"]
-    subagents = [r for r in records if r.orchestration_role == "SUBAGENT"]
-
+    subagents     = [r for r in records if r.orchestration_role == "SUBAGENT"]
     for rec in records:
         nodes.append({
-            "id":            rec.agent_id,
-            "label":         rec.display_name or rec.agent_id[:12],
-            "role":          rec.orchestration_role,
-            "agent_role":    rec.agent_role or "—",
-            "risk_level":    rec.risk_level or "—",
-            "drift_score":   round(rec.drift_score, 3),
+            "id": rec.agent_id, "label": rec.display_name or rec.agent_id[:12],
+            "role": rec.orchestration_role, "agent_role": rec.agent_role or "—",
+            "risk_level": rec.risk_level or "—", "drift_score": round(rec.drift_score, 3),
+            "authority_score": 0.0,
         })
-
-    # Infer edges: orchestrators → subagents (heuristic — refined in Module 8)
     for orch in orchestrators:
         for sub in subagents:
-            edges.append({
-                "source":      orch.agent_id,
-                "target":      sub.agent_id,
-                "inferred":    True,   # true topology edge requires Module 8 call-chain analysis
-            })
-
-    return {
-        "nodes":       nodes,
-        "edges":       edges,
-        "note":        "Heuristic topology. Full kill-chain analysis available in Module 8 (Agent Network Topology).",
-    }
+            edges.append({"source": orch.agent_id, "target": sub.agent_id, "inferred": True})
+    return {"nodes": nodes, "edges": edges, "kill_chains": [], "escalated_alerts": [],
+            "summary": {}, "note": "Fallback topology (Module 8 not loaded)."}
 
 
 # ---------------------------------------------------------------------------
