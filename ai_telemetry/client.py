@@ -221,7 +221,14 @@ class TelemetryClient:
         # Entity classification
         user_ctx = current_user_context.get()
         entity_key = user_ctx.get("user_id") or "unknown"
-        session_id = event.trace_id or entity_key
+        # Session state must persist ACROSS calls from the same caller so the
+        # behavioral classifier can accumulate timing/structure signals over
+        # multiple turns. trace_id is fresh per request and would isolate every
+        # call into its own single-turn session — leaving every event stuck at
+        # the 0.5 baseline (AMBIGUOUS). Default to entity_key (per-user session)
+        # and let the host app override via user_ctx["session_id"] when it has
+        # a more meaningful conversation id.
+        session_id = user_ctx.get("session_id") or entity_key
 
         # --- Module 1: ip_hash and http_headers_digest from request context ----
         # The host application sets "ip_address" and/or "http_headers" in

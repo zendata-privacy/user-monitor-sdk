@@ -476,6 +476,7 @@ def _compute_caller_type(
     signals: List[str],
     session_score: float,
     m1_subtype: Optional[str],
+    is_first_turn: bool = False,
 ) -> Tuple[float, str, Optional[str]]:
     """Compute the updated session caller_type_score and derive entity_type.
 
@@ -485,13 +486,41 @@ def _compute_caller_type(
     ---------
     1. Per-turn score = 0.5 + Σ(signal weights for this turn), clamped [0, 1].
     2. EMA update: session_score = α·per_turn + (1-α)·session_score.
-    3. Entity type from thresholds; M1 overrides < 0.25 → AGENT vs AUTOMATED.
+       On the first turn there is no prior session score to blend against,
+       so we use the per-turn score directly. Otherwise the 0.5 starting
+       baseline drags strong signals back toward AMBIGUOUS for several
+       turns, which is wrong for short bursts (e.g. a 5-call robot batch).
+    3. Strong-signal short-circuit: if 3+ HIGH-weight agent signals fire on
+       the same turn (T1 + T3 + A2 + P1 + P4 + S4 …), classify as AUTOMATED
+       immediately regardless of the EMA — these together have effectively
+       zero false-positive rate against humans.
+    4. Entity type from thresholds; M1 overrides < 0.25 → AGENT vs AUTOMATED.
     """
     per_turn_delta = sum(_SIGNAL_WEIGHTS.get(s, 0.0) for s in signals)
     per_turn_score = max(0.0, min(1.0, 0.5 + per_turn_delta))
 
-    new_score = _EMA_ALPHA * per_turn_score + (1.0 - _EMA_ALPHA) * session_score
+    if is_first_turn:
+        new_score = per_turn_score
+    else:
+        new_score = _EMA_ALPHA * per_turn_score + (1.0 - _EMA_ALPHA) * session_score
     new_score = max(0.0, min(1.0, new_score))
+
+    # Strong-signal short-circuit — count HIGH-magnitude agent signals fired
+    # on this turn. Three independent HIGH agent signals overwhelmingly
+    # indicate automation; force the score below the AGENT threshold so the
+    # caller is not stuck in AMBIGUOUS while the EMA catches up.
+    _STRONG_AGENT = {
+        "T1_SUBMISSION_VELOCITY",
+        "T2_LOW_LATENCY_VARIANCE",
+        "T3_TYPING_SPEED",
+        "P1_TEMPLATE_STRUCTURE",
+        "P4_IMPERATIVE_FRAMING",
+        "A2_BURST_CALLS",
+        "S4_SIMULTANEOUS_SESSIONS",
+    }
+    strong_hits = sum(1 for s in signals if s in _STRONG_AGENT)
+    if strong_hits >= 3 and new_score >= _THRESHOLD_AGENT:
+        new_score = min(new_score, 0.20)
 
     if new_score < _THRESHOLD_AGENT:
         # M1 delegation language distinguishes AGENT from AUTOMATED
@@ -604,6 +633,7 @@ def classify_event(
         classification_signals,
         state.caller_type_score,
         m1_subtype,
+        is_first_turn=(turn_index == 0),
     )
 
     # If AMBIGUOUS and session has a more definitive prior classification,
