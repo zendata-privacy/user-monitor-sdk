@@ -367,7 +367,7 @@ def _check_D2(state: "SessionState", submission_ms: int) -> List[str]:
     Session classified as AUTOMATED/AGENT suddenly shows human timing
     (> 2 000 ms gap) after at least 2 turns → TAKEOVER_ALERT.
     """
-    if state.entity_type not in ("AUTOMATED", "AGENT"):
+    if state.entity_type not in ("API CALL", "AGENT"):
         return []
     if len(state.turns) < 2:
         return []
@@ -524,7 +524,7 @@ def _compute_caller_type(
 
     if new_score < _THRESHOLD_AGENT:
         # M1 delegation language distinguishes AGENT from AUTOMATED
-        entity_type = "AGENT" if "M1_DELEGATION_LANGUAGE" in signals else "AUTOMATED"
+        entity_type = "AGENT" if "M1_DELEGATION_LANGUAGE" in signals else "API CALL"
         entity_subtype = m1_subtype
     elif new_score > _THRESHOLD_HUMAN:
         entity_type = "HUMAN"

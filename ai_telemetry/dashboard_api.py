@@ -92,7 +92,7 @@ def identity_overview() -> List[Dict]:
 
 def caller_split(events: List[Dict]) -> Dict:
     """Distribution of entity types + caller_type_score histogram."""
-    counts: Dict[str, int] = {"HUMAN": 0, "AUTOMATED": 0, "AGENT": 0,
+    counts: Dict[str, int] = {"HUMAN": 0, "API CALL": 0, "AGENT": 0,
                                "AMBIGUOUS": 0, "UNKNOWN": 0}
     score_buckets = [0] * 10  # 10 buckets: 0.0-0.1, 0.1-0.2, …
 
@@ -438,7 +438,7 @@ def iam_enrichment_status(events: Optional[List[Dict]] = None) -> Dict:
             )
             looks_like_service = any(m in blob for m in service_markers)
 
-            if looks_like_service or dominant in ("AUTOMATED", "AGENT"):
+            if looks_like_service or dominant in ("API CALL", "AGENT"):
                 # Not a human caller — skip from the human_callers table.
                 continue
 

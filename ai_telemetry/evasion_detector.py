@@ -642,7 +642,7 @@ class EvasionDetector:
 
         # Also check: agent-classified entity having typos is suspicious
         typo_in_agent_session = any(
-            state.entity_type_history[i] in ("AUTOMATED", "AGENT")
+            state.entity_type_history[i] in ("API CALL", "AGENT")
             for i in typo_turns
             if i < len(state.entity_type_history)
         )

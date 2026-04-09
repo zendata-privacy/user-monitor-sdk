@@ -328,7 +328,7 @@ class TelemetryClient:
             if event.event_type == "llm_call":
                 evaluate_event(event)
                 # Module 3 — build/update agent fingerprint for non-human callers
-                if event.entity_type in ("AUTOMATED", "AGENT", "AMBIGUOUS"):
+                if event.entity_type in ("API CALL", "AGENT", "AMBIGUOUS"):
                     try:
                         fingerprint_agent(event)
                     except Exception as ex:
