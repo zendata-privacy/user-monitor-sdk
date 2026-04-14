@@ -3,9 +3,13 @@
 openai>=1.0
 anthropic>=0.20
 langchain-core>=0.1
+boto3>=1.28
 
 [anthropic]
 anthropic>=0.20
+
+[aws]
+boto3>=1.28
 
 [dev]
 pytest

@@ -29,6 +29,11 @@ def init(
     enable_local_log: bool = False,
     log_path: Optional[str] = None,
     embed_fn: Optional[Callable[[str], List[float]]] = None,
+    enable_pii_redaction: bool = False,
+    pii_language: str = "en",
+    pii_entity_types: Optional[List[str]] = None,
+    pii_mask_format: str = "[{type}]",
+    aws_region: Optional[str] = None,
 ) -> TelemetryClient:
     """
     Initialize the AI Telemetry SDK.
@@ -66,6 +71,16 @@ def init(
     """
     global _default_client
 
+    redactor = None
+    if enable_pii_redaction:
+        from ai_telemetry.redaction import ComprehendRedactor
+        redactor = ComprehendRedactor(
+            language_code=pii_language,
+            entity_types=pii_entity_types,
+            mask_format=pii_mask_format,
+            aws_region=aws_region,
+        )
+
     client = TelemetryClient(
         app_id=app_id,
         api_key=api_key,
@@ -75,6 +90,7 @@ def init(
         enable_local_log=enable_local_log,
         log_path=log_path,
         embed_fn=embed_fn,
+        pii_redactor=redactor,
     )
     _default_client = client
 

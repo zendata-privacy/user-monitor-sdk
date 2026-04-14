@@ -167,6 +167,7 @@ class TelemetryClient:
         enable_local_log: bool = False,
         log_path: Optional[str] = None,
         embed_fn: Optional[Callable[[str], List[float]]] = None,
+        pii_redactor: Optional[Any] = None,
     ):
         self.app_id = app_id
         self.api_key = api_key
@@ -177,6 +178,7 @@ class TelemetryClient:
         self.debug = debug
         self.enable_local_log = enable_local_log
         self.embed_fn = embed_fn  # optional callable: str -> List[float] (e.g. 768-dim sentence embedding)
+        self.pii_redactor = pii_redactor  # optional ComprehendRedactor (or any .redact()-shaped object)
         # Pre-compute the API-key hash once so every event gets it for free
         self._api_key_hash: Optional[str] = _sha256(api_key) if api_key else None
         self.log_path = log_path or os.path.join(
@@ -287,6 +289,13 @@ class TelemetryClient:
             event.output_message = None
             event.tool_input = None
             event.tool_output = None
+        elif self.pii_redactor is not None:
+            try:
+                from ai_telemetry.redaction import apply_redaction_to_event
+                apply_redaction_to_event(event, self.pii_redactor)
+            except Exception as exc:
+                if self.debug:
+                    print(f"[AI Telemetry] PII redaction skipped: {exc}")
         try:
             self._queue.put_nowait(event)
         except queue.Full:
