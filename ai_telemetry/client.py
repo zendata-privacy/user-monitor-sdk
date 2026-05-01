@@ -178,7 +178,7 @@ class TelemetryClient:
         self.debug = debug
         self.enable_local_log = enable_local_log
         self.embed_fn = embed_fn  # optional callable: str -> List[float] (e.g. 768-dim sentence embedding)
-        self.pii_redactor = pii_redactor  # optional ComprehendRedactor (or any .redact()-shaped object)
+        self.pii_redactor = pii_redactor  # any object with .redact(text) -> (masked, [types])
         # Pre-compute the API-key hash once so every event gets it for free
         self._api_key_hash: Optional[str] = _sha256(api_key) if api_key else None
         self.log_path = log_path or os.path.join(

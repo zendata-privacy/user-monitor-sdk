@@ -25,12 +25,22 @@ Your App → [AI Telemetry SDK] → (batched HTTPS) → Your Ingest Endpoint →
 ### Install
 
 ```bash
-pip install ai-telemetry-sdk                    # core only
+pip install ai-telemetry-sdk                    # core only — zero hard dependencies
 pip install "ai-telemetry-sdk[openai]"          # + OpenAI
 pip install "ai-telemetry-sdk[anthropic]"       # + Anthropic
 pip install "ai-telemetry-sdk[langchain]"       # + LangChain
 pip install "ai-telemetry-sdk[all]"             # everything
 ```
+
+The SDK itself is **cloud-agnostic** — there is no AWS or Azure SDK in
+its dependency graph. PII masking is delegated to a user-supplied
+redactor (the project root provides a Zendata `pii-api` integration);
+log shipping is handled by the project-level `upload_blob_bucket.py`, which
+selects between Amazon S3 and Azure Blob Storage at runtime via a
+`CLOUD_PROVIDER` env var. See `../guide_to_deploy.md` §8 and §10b for
+the multi-cloud deployment recipe (Azure Container Instances and
+Azure Container Apps, with the AWS-hosted `pii-api` reached over
+HTTPS).
 
 ### Quickstart — OpenAI auto-patch
 
