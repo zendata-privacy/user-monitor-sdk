@@ -192,7 +192,7 @@ from your own datastore into `store.update_baseline(entity_key, score)`.
 
 ```python
 import time, sys
-sys.path.insert(0, "sdk_v1")
+sys.path.insert(0, "user-monitor-sdk")
 
 from ai_telemetry.session_state import SessionStore
 from ai_telemetry.entity_classifier import classify_event
@@ -244,14 +244,14 @@ This section consolidates every change your application code must make for the S
 
 ### 1. Make the SDK importable
 
-The SDK is a local package (`sdk_v1/`). Add it to `sys.path` **at the very top of your entry point**, before any other import, so it works regardless of how the server is launched (uvicorn, gunicorn, pytest, etc.):
+The SDK is a local package (`user-monitor-sdk/`). Add it to `sys.path` **at the very top of your entry point**, before any other import, so it works regardless of how the server is launched (uvicorn, gunicorn, pytest, etc.):
 
 ```python
 # app/main.py  — must be the first lines of the file
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "sdk_v1"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "user-monitor-sdk"))
 
 # All other imports follow
 import ai_telemetry as telemetry
@@ -420,7 +420,7 @@ We welcome contributions to expand the ecosystem! Here is how you can contribute
 
 ### Adding a New Auto-Patcher (e.g., OpenAI GPT-4o, Cohere)
 If you want to add auto-instrumentation for a new LLM provider library:
-1. Create a new file: `sdk_v1/ai_telemetry/integrations/yourprovider_integration.py`.
+1. Create a new file: `user-monitor-sdk/ai_telemetry/integrations/yourprovider_integration.py`.
 2. Implement a `patch_yourprovider(client: TelemetryClient)` function.
 3. Monkey-patch the library's base generation method to wrap it in timing logic and construct a `TelemetryEvent`.
 4. Add the flag to `ai_telemetry/__init__.py`'s `init()` parameters (e.g., `auto_patch_yourprovider=False`).
@@ -471,7 +471,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # Install your local telemetry SDK in editable mode
-pip install -e ./sdk_v1
+pip install -e ./user-monitor-sdk
 ```
 
 ## Step 2: Configure Environment Variables
