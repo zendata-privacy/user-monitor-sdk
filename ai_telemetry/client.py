@@ -491,11 +491,26 @@ class TelemetryClient:
 
         log_file = self.log_path
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        file_exists = os.path.isfile(log_file)
+
+        # Write the header when the file carries NO DATA — not merely when it is
+        # absent. An existing-but-empty file still needs one, and that case is
+        # not hypothetical: ai_tester.py clears this exact path with
+        # open(p, "w") before a run, which leaves a 0-byte file behind. Keying
+        # off os.path.isfile() therefore suppressed the header for every
+        # container run, and every consumer downstream reads a CSV header
+        # positionally — csv.DictReader in the Elastic indexer, and the
+        # gateway dashboard's _parseCSV — so they silently took the FIRST EVENT
+        # as their column names and every row came back with user_id undefined.
+        # A headerless telemetry file is indistinguishable from a corrupt one;
+        # size, not existence, is the question worth asking.
+        try:
+            needs_header = os.path.getsize(log_file) == 0
+        except OSError:
+            needs_header = True   # missing file — created in append mode below
 
         with open(log_file, mode='a', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=headers, delimiter=',')
-            if not file_exists:
+            if needs_header:
                 writer.writeheader()
 
             for e in events:
