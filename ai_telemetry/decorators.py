@@ -146,6 +146,14 @@ def trace_tool(telemetry: "TelemetryClient", tool_name: Optional[str] = None):
             department=updated_ctx.get("department"),
             job_title=updated_ctx.get("job_title"),
             sailpoint_risk=updated_ctx.get("sailpoint_risk"),
+            # The accumulated list was being written back to the CONTEXT so a
+            # later llm_call could see it, but never onto the tool_call event
+            # itself — so every tool_call shipped with tools_called empty, and
+            # in an agent loop the llm_call that decides which tool to use runs
+            # BEFORE any tool, so it saw an empty list too. Net effect: the
+            # column existed and was never populated by anything.
+            tools_called=updated_ctx.get("tools_called"),
+            data_sources=updated_ctx.get("data_sources"),
             **error_info,
         )
         telemetry.capture(event)

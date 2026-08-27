@@ -30,6 +30,7 @@ def init(
     log_path: Optional[str] = None,
     embed_fn: Optional[Callable[[str], List[float]]] = None,
     pii_redactor: Optional[object] = None,
+    classify_pii: bool = True,
 ) -> TelemetryClient:
     """
     Initialize the AI Telemetry SDK.
@@ -47,6 +48,11 @@ def init(
                              the SDK will populate ``system_prompt_embedding`` on
                              every LLM call event for agent similarity clustering
                              and version-drift detection (Module 1).
+        classify_pii:        Label pii_detected/pii_types with the built-in
+                             regex classifier when no redactor is supplied
+                             (default True). It labels only, never masks, and
+                             runs before prompts are dropped so the signal
+                             survives capture_prompts=False.
         pii_redactor:        Optional bring-your-own redactor exposing
                              ``.redact(text) -> (masked, [types])``. The reference
                              implementation is the Zendata PII API client; see
@@ -81,6 +87,7 @@ def init(
         log_path=log_path,
         embed_fn=embed_fn,
         pii_redactor=pii_redactor,
+        classify_pii=classify_pii,
     )
     _default_client = client
 

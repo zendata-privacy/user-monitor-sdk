@@ -19,6 +19,16 @@ from datetime import datetime, timezone
 from typing import Callable, Optional, Dict, Any, List
 from dataclasses import dataclass, field, asdict
 
+# Imported at module load, NOT inside capture(). Deferring it put the module
+# import and the regex compilation on the first captured event — ~8ms on the
+# caller's request path, in a method whose entire contract is that it does not
+# block. A lazy import inside a hot path only moves the cost, it does not remove
+# it, and it moves it somewhere unmeasured.
+try:
+    from ai_telemetry.detection import apply_classification_to_event as _classify_event
+except Exception:                                   # pragma: no cover
+    _classify_event = None
+
 
 # ---------------------------------------------------------------------------
 # Module-level helpers (used by integrations too)
@@ -168,6 +178,7 @@ class TelemetryClient:
         log_path: Optional[str] = None,
         embed_fn: Optional[Callable[[str], List[float]]] = None,
         pii_redactor: Optional[Any] = None,
+        classify_pii: bool = True,
     ):
         self.app_id = app_id
         self.api_key = api_key
@@ -179,6 +190,10 @@ class TelemetryClient:
         self.enable_local_log = enable_local_log
         self.embed_fn = embed_fn  # optional callable: str -> List[float] (e.g. 768-dim sentence embedding)
         self.pii_redactor = pii_redactor  # any object with .redact(text) -> (masked, [types])
+        # Built-in, dependency-free PII labelling used when no redactor is
+        # supplied. Set False to record nothing about PII at all — which means
+        # pii_types stays empty and no consumer can tell that from "clean".
+        self.classify_pii = classify_pii
         # Pre-compute the API-key hash once so every event gets it for free
         self._api_key_hash: Optional[str] = _sha256(api_key) if api_key else None
         self.log_path = log_path or os.path.join(
@@ -284,18 +299,33 @@ class TelemetryClient:
                 event.entity_type = state.entity_type
                 event.entity_subtype = state.entity_subtype
 
-        if not self.capture_prompts:
-            event.input_messages = None
-            event.output_message = None
-            event.tool_input = None
-            event.tool_output = None
-        elif self.pii_redactor is not None:
+        # PII classification runs BEFORE prompts are dropped, so the signal
+        # survives capture_prompts=False: you learn that SSNs are flowing through
+        # the assistant without storing a single one.
+        #
+        # A supplied redactor wins — it both masks and labels. The built-in
+        # classifier only labels, and exists because an unset pii_types is
+        # indistinguishable from "we looked and found nothing", so every
+        # downstream consumer read clean traffic where nobody had looked at all.
+        if self.pii_redactor is not None and self.capture_prompts:
             try:
                 from ai_telemetry.redaction import apply_redaction_to_event
                 apply_redaction_to_event(event, self.pii_redactor)
             except Exception as exc:
                 if self.debug:
                     print(f"[AI Telemetry] PII redaction skipped: {exc}")
+        elif self.classify_pii and _classify_event is not None:
+            try:
+                _classify_event(event)
+            except Exception as exc:
+                if self.debug:
+                    print(f"[AI Telemetry] PII classification skipped: {exc}")
+
+        if not self.capture_prompts:
+            event.input_messages = None
+            event.output_message = None
+            event.tool_input = None
+            event.tool_output = None
         try:
             self._queue.put_nowait(event)
         except queue.Full:
