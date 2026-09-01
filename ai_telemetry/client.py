@@ -149,6 +149,16 @@ class TelemetryEvent:
     inter_turn_latency_ms: Optional[int] = None    # ms between last response and this submission
     prompt_submission_time_ms: Optional[int] = None  # epoch ms when the prompt was submitted
 
+    # Build provenance — which repository and commit this running artifact was
+    # built from. Stamped at build time (ZENDATA_REPO / ZENDATA_COMMIT); see
+    # ai_telemetry/provenance.py. This is what lets the correlator bind a repo to
+    # a live app on the application's own report rather than on an operator's
+    # assertion, and what lets it detect that the code someone SCANNED is not the
+    # code that is RUNNING.
+    repo: Optional[str] = None
+    commit_sha: Optional[str] = None       # may carry a "-dirty" suffix
+    build_id: Optional[str] = None
+
     # Custom metadata
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -223,6 +233,14 @@ class TelemetryClient:
         # api_key_hash: attach unless the caller has already set it
         if not event.api_key_hash:
             event.api_key_hash = self._api_key_hash
+
+        # build provenance: same contract as api_key_hash — attach unless the
+        # caller set it. current_provenance() is lru_cached, so this is a tuple
+        # lookup after the first event, and it is deliberately silent when the
+        # build was not stamped: absence is reported as absence, never guessed.
+        if not event.repo:
+            from ai_telemetry.provenance import current_provenance
+            event.repo, event.commit_sha, event.build_id = current_provenance()
 
         # Auto-populate trace context from context vars if not explicitly set on the event
         from ai_telemetry.context import _current_trace_id, _current_span_id, current_user_context
@@ -496,6 +514,23 @@ class TelemetryClient:
         if self.debug:
             print(f"[AI Telemetry] Send failed after {_MAX_RETRIES} retries: {last_err}")
 
+    @staticmethod
+    def _existing_csv_header(path: str) -> List[str]:
+        """The column names already written to ``path``, or [] if unreadable.
+
+        Reads one line. Never raises: a header we cannot read is treated the same
+        as no header at all, and the caller falls back to the current shape.
+        """
+        try:
+            with open(path, newline='', encoding='utf-8') as fh:
+                first = fh.readline()
+            if not first.strip():
+                return []
+            # ﻿: a BOM on column 1 would make "event_id" compare unequal.
+            return [c.strip().lstrip('﻿') for c in next(csv.reader([first]))]
+        except (OSError, UnicodeDecodeError, StopIteration, csv.Error):
+            return []
+
     def _write_csv(self, events: List[TelemetryEvent]):
         headers = [
             "event_id", "timestamp_iso", "event_type", "trace_id", "span_id", "parent_span_id",
@@ -517,6 +552,12 @@ class TelemetryClient:
             "agent_role", "agent_risk_level", "agent_primary_risk", "role_scope_gap",
             # Module 5 — Behavioral Drift Detection
             "zasp_score", "drift_score", "drift_classification", "drift_signals",
+            # Build provenance — APPENDED AT THE END, deliberately. Every reader
+            # of this file is positional once the header is parsed, so inserting
+            # a column mid-list shifts every column after it for anyone holding
+            # an older header. Growing only at the tail is the one change that
+            # leaves existing columns where they were.
+            "repo", "commit_sha", "build_id",
         ]
 
         log_file = self.log_path
@@ -538,8 +579,30 @@ class TelemetryClient:
         except OSError:
             needs_header = True   # missing file — created in append mode below
 
+        # Reconcile against a header this file ALREADY has. csv.DictWriter emits
+        # positionally from `fieldnames` and knows nothing about the file it is
+        # appending to: given a 51-column header on disk and a 54-name fieldnames
+        # list, it does not raise — it writes 54-field rows under a 51-field
+        # header, and csv.DictReader then buries the extra values in row[None].
+        # Every consumer doing row.get("repo") silently gets "", which is exactly
+        # the invisible binding failure this whole feature exists to eliminate.
+        # So: when the file on disk disagrees, write in ITS shape and say so.
+        if not needs_header:
+            existing = self._existing_csv_header(log_file)
+            if existing and existing != headers:
+                if self.debug:
+                    missing = [h for h in headers if h not in existing]
+                    print(f"[AI Telemetry] {log_file} was written with a different "
+                          f"column set; appending in the file's shape. Columns that "
+                          f"cannot be recorded: {missing or 'none'}")
+                headers = existing
+
         with open(log_file, mode='a', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=headers, delimiter=',')
+            # extrasaction="ignore": a row may legitimately carry keys the FILE's
+            # header lacks (see reconciliation above). Dropping them keeps the
+            # rows aligned, which matters more than recording a late column.
+            writer = csv.DictWriter(f, fieldnames=headers, delimiter=',',
+                                    extrasaction='ignore')
             if needs_header:
                 writer.writeheader()
 
@@ -603,6 +666,10 @@ class TelemetryClient:
                     "agent_risk_level": e.agent_risk_level or "",
                     "agent_primary_risk": e.agent_primary_risk or "",
                     "role_scope_gap": e.role_scope_gap if e.role_scope_gap is not None else "",
+                    # Build provenance
+                    "repo": e.repo or "",
+                    "commit_sha": e.commit_sha or "",
+                    "build_id": e.build_id or "",
                     # system_prompt_embedding is omitted from CSV (float[] — stored in JSONL only)
                 }
                 meta = e.metadata or {}
