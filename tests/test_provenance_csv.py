@@ -134,14 +134,28 @@ def test_csv_carries_provenance_columns_aligned(monkeypatch, csv_client):
 def test_provenance_columns_are_appended_at_the_end(csv_client):
     """Position is a compatibility contract: every reader is positional once the
     header is parsed, so a column inserted mid-list shifts everything after it
-    for anyone holding an older header."""
+    for anyone holding an older header.
+
+    Build provenance is no longer the LAST block — Module 9 appended source
+    provenance and scope columns after it, which is the convention being
+    honoured rather than broken. What must hold is that the three build columns
+    stay contiguous and keep their offsets, so a consumer holding the older
+    header still reads every column it knows at the index it knows it at.
+    """
     client, path = csv_client()
     ev = TelemetryEvent(event_type="llm_call")
     client.capture(ev)
     client._write_csv([ev])
     with open(path, newline="", encoding="utf-8") as fh:
         header = next(csv.reader(fh))
-    assert header[-3:] == ["repo", "commit_sha", "build_id"]
+
+    start = header.index("repo")
+    assert header[start:start + 3] == ["repo", "commit_sha", "build_id"]
+    # Everything that existed before Module 9 ends at build_id; nothing new was
+    # spliced in ahead of it.
+    assert header[start - 1] == "drift_signals"
+    # Scope columns are strictly after, so older positional readers are unmoved.
+    assert header.index("source_uri") > start + 2
 
 
 def test_header_is_written_once_not_per_flush(csv_client):

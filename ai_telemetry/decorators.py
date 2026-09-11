@@ -111,13 +111,36 @@ def trace_llm(
     return decorator
 
 
-def trace_tool(telemetry: "TelemetryClient", tool_name: Optional[str] = None):
+def trace_tool(
+    telemetry: "TelemetryClient",
+    tool_name: Optional[str] = None,
+    source_uri: Optional[str] = None,
+    classification: Optional[str] = None,
+):
     """
     Decorator: wraps any tool/function call and captures telemetry.
 
     @trace_tool(client, tool_name="web_search")
     def web_search(query: str) -> str:
         ...
+
+    ``source_uri`` declares where this tool reads from, which is what the scope
+    boundary check needs and what the SDK cannot work out for itself — all it
+    sees here is a function name, its arguments and its return value::
+
+        @trace_tool(client, tool_name="lookup_account",
+                    source_uri="arn:aws:dynamodb:us-east-1:...:table/CustomerAccounts")
+        def lookup_account(customer_id: str) -> dict:
+            ...
+
+    Use it for tools that always read the same place. For sources only known at
+    runtime use ``source_context()``; for boto3 calls, the interceptor reports
+    the real ARN with no annotation at all.
+
+    ``classification`` optionally pins what this tool returns (PII, PHI,
+    CREDENTIALS, INTERNAL, PUBLIC) when the operator knows better than content
+    inspection does — a table of pseudonymous ids that content scanning would
+    read as clean, for instance.
     """
     def _capture_tool_event(name, start, args, kwargs, result, error_info):
         from ai_telemetry.client import TelemetryEvent
@@ -156,6 +179,14 @@ def trace_tool(telemetry: "TelemetryClient", tool_name: Optional[str] = None):
             data_sources=updated_ctx.get("data_sources"),
             **error_info,
         )
+        # Declared source identity — producer 1 of the four described in
+        # ai_telemetry/scope_runtime.py. Set on the event rather than resolved
+        # here: hashing and classifying the content is background-thread work,
+        # and this decorator runs on the caller's.
+        if source_uri:
+            event.source_uri = source_uri
+        if classification:
+            event.source_classification = classification
         telemetry.capture(event)
 
     def decorator(fn):
