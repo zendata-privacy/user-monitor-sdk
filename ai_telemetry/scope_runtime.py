@@ -146,9 +146,9 @@ def evaluate_scope(client, event) -> None:
     would take down observability to report a policy finding, which is a trade
     nobody would accept if it were offered explicitly.
     """
-    manifest = getattr(client, "manifest", None)
     agent_id = getattr(event, "agent_id", None) or client.app_id
     session_id = _session_id(event, client)
+    manifest = _manifest_for(client, event, agent_id)
 
     violations: List[Any] = []
 
@@ -342,6 +342,29 @@ def _handoff_for(event) -> Optional[InterAgentMessage]:
     if isinstance(raw, dict):
         return InterAgentMessage.from_dict(raw)
     return None
+
+
+def _manifest_for(client, event, agent_id):
+    """The declared scope to judge THIS event against.
+
+    One process, one manifest is the normal case and stays the default. But a
+    gateway or a demo assistant serves many principals from a single process,
+    and there the manifest is a property of the caller rather than of the
+    deployment — checking every identity's retrievals against one agent's scope
+    would be meaningless in both directions.
+
+    So a ``manifest_store`` is consulted first, keyed by the event's own
+    identity. Falling back to ``client.manifest`` keeps the single-agent case
+    working unchanged.
+    """
+    store = getattr(client, "manifest_store", None)
+    if store is not None:
+        for key in (getattr(event, "user_id", None), getattr(event, "agent_id", None), agent_id):
+            if key:
+                found = store.get(key)
+                if found is not None:
+                    return found
+    return getattr(client, "manifest", None)
 
 
 def _baseline_for(client, agent_id):

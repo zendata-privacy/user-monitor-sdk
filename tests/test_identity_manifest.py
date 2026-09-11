@@ -303,3 +303,102 @@ class TestRosterCoherence:
         first_new = next(i for i, h in enumerate(hashes) if h != hashes[0])
         assert rows[first_new]["story_phase"] in ("RECON", "PROBE", "ESCALATION")
         assert "config change" in rows[first_new]["story_note"].lower()
+
+
+class TestPerIdentityManifests:
+    """One process, many principals — scope is a property of the CALLER.
+
+    A gateway or a demo assistant serves hundreds of identities from a single
+    client. Judging every identity's retrievals against one agent's manifest is
+    meaningless in both directions: it invents violations for identities granted
+    more, and hides them for identities granted less.
+    """
+
+    def _client(self, tmp_path, **kw):
+        import ai_telemetry
+        c = ai_telemetry.init(
+            app_id="gateway", api_key="sk", endpoint="http://127.0.0.1:1",
+            enable_local_log=True, log_path=str(tmp_path / "e.csv"), **kw)
+        c._send_http = lambda e: None
+        return c
+
+    def _roster(self, tmp_path):
+        f = tmp_path / "roster.csv"
+        f.write_text("id,entitlements,identity_type\n"
+                     "alice,crm.read|reporting.read,human\n"
+                     "bob,payroll_db.read,human\n")
+        return f
+
+    def test_each_identity_is_judged_against_its_own_scope(self, tmp_path):
+        from ai_telemetry.client import TelemetryEvent
+        from ai_telemetry.context import current_user_context
+        from ai_telemetry.scope_checker import SC_OUT_OF_SCOPE_SOURCE
+        from ai_telemetry import scope_runtime
+        scope_runtime._seen_sessions.clear()
+
+        client = self._client(tmp_path, identity_roster=str(self._roster(tmp_path)))
+        assert len(client.manifest_store) == 2
+
+        # alice reading crm is fine; bob reading crm is not.
+        out = {}
+        for uid in ("alice", "bob"):
+            current_user_context.set({"user_id": uid, "session_id": uid})
+            ev = TelemetryEvent(event_type="tool_call", user_id=uid,
+                                data_sources="crm", tool_output="x")
+            client.capture(ev); client._send([ev])
+            out[uid] = ev.scope_signals
+        assert out["alice"] is None
+        assert out["bob"] == SC_OUT_OF_SCOPE_SOURCE
+
+    def test_coverage_is_reported_for_every_known_identity(self, tmp_path):
+        """manifest_version on the event is what the dashboard counts as
+        'scoped'. An identity with a manifest must always carry it, violation
+        or not — otherwise coverage reads 0% and the tab says 'not measured'
+        for traffic that WAS measured."""
+        from ai_telemetry.client import TelemetryEvent
+        from ai_telemetry.context import current_user_context
+        client = self._client(tmp_path, identity_roster=str(self._roster(tmp_path)))
+        current_user_context.set({"user_id": "alice", "session_id": "s"})
+        ev = TelemetryEvent(event_type="tool_call", user_id="alice",
+                            data_sources="crm", tool_output="x")
+        client.capture(ev); client._send([ev])
+        assert ev.manifest_version == 1
+
+    def test_an_unknown_identity_falls_back_rather_than_inventing_scope(self, tmp_path):
+        """Somebody absent from the roster has no declared scope. Judging them
+        against another identity's manifest would manufacture a violation."""
+        from ai_telemetry.client import TelemetryEvent
+        from ai_telemetry.context import current_user_context
+        client = self._client(tmp_path, identity_roster=str(self._roster(tmp_path)))
+        current_user_context.set({"user_id": "stranger", "session_id": "s2"})
+        ev = TelemetryEvent(event_type="tool_call", user_id="stranger",
+                            data_sources="anything", tool_output="x")
+        client.capture(ev); client._send([ev])
+        assert ev.scope_signals is None
+        assert ev.manifest_version is None
+
+    def test_the_single_manifest_case_is_unchanged(self, tmp_path):
+        """No store configured — the original one-agent behaviour must hold."""
+        from ai_telemetry.client import TelemetryEvent
+        from ai_telemetry.context import current_user_context
+        from ai_telemetry.scope_checker import SC_OUT_OF_SCOPE_SOURCE
+        client = self._client(tmp_path, permitted_sources=["crm"],
+                              permitted_classifications=["INTERNAL", "PUBLIC"])
+        assert client.manifest_store is None
+        current_user_context.set({"user_id": "anyone", "session_id": "s3"})
+        ev = TelemetryEvent(event_type="tool_call", user_id="anyone",
+                            data_sources="payroll_db", tool_output="x")
+        client.capture(ev); client._send([ev])
+        assert ev.scope_signals == SC_OUT_OF_SCOPE_SOURCE
+
+    def test_the_store_wins_over_the_single_manifest(self, tmp_path):
+        from ai_telemetry.client import TelemetryEvent
+        from ai_telemetry.context import current_user_context
+        client = self._client(tmp_path, identity_roster=str(self._roster(tmp_path)),
+                              permitted_sources=["nothing-relevant"],
+                              permitted_classifications=["PUBLIC"])
+        current_user_context.set({"user_id": "alice", "session_id": "s4"})
+        ev = TelemetryEvent(event_type="tool_call", user_id="alice",
+                            data_sources="crm", tool_output="x")
+        client.capture(ev); client._send([ev])
+        assert ev.scope_signals is None      # alice's own manifest permits crm

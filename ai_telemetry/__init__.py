@@ -52,6 +52,8 @@ def init(
     max_hash_bytes: Optional[int] = None,
     baseline_path: Optional[str] = None,
     baseline_store: Optional[object] = None,
+    manifest_store: Optional[object] = None,
+    identity_roster: Optional[str] = None,
 ) -> TelemetryClient:
     """
     Initialize the AI Telemetry SDK.
@@ -108,6 +110,13 @@ def init(
                              by the host because the SDK has no LLM client and no
                              hard dependencies.
         permitted_sources:   Explicit override of the derived source list.
+        identity_roster:     Path to an identity/entitlement CSV. Builds one
+                             manifest per principal, for a process serving many
+                             of them — a gateway, or a demo assistant. Consulted
+                             before the single ``manifest``; without it, every
+                             identity's retrievals would be judged against one
+                             agent's scope, which is meaningless in both
+                             directions.
         baseline_path:       Path to baselines.jsonl from
                              ``python -m ai_telemetry.baseline_builder``. Activates
                              the soft boundary for any agent with at least 100
@@ -160,6 +169,13 @@ def init(
             manifest_version=manifest_version,
         )
 
+    if manifest_store is None and identity_roster:
+        from ai_telemetry.identity_manifest import IdentityManifestStore
+        manifest_store = IdentityManifestStore.from_csv(identity_roster)
+        if debug:
+            print(f"[AI Telemetry] Loaded {len(manifest_store)} manifest(s) "
+                  f"from {identity_roster}")
+
     if baseline_store is None and baseline_path:
         from ai_telemetry.baseline import BaselineStore
         baseline_store = BaselineStore.from_jsonl(baseline_path)
@@ -184,6 +200,7 @@ def init(
         pii_api_endpoint=pii_api_endpoint,
         max_hash_bytes=max_hash_bytes,
         baseline_store=baseline_store,
+        manifest_store=manifest_store,
     )
     _default_client = client
 

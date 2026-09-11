@@ -222,6 +222,7 @@ class TelemetryClient:
         pii_api_endpoint: Optional[str] = None,
         max_hash_bytes: Optional[int] = None,
         baseline_store: Optional[Any] = None,
+        manifest_store: Optional[Any] = None,
     ):
         self.app_id = app_id
         self.api_key = api_key
@@ -247,6 +248,9 @@ class TelemetryClient:
         # SC_* source signal stays silent — an agent nobody scoped is reported
         # as unscoped, never as compliant.
         self.manifest = manifest
+        # Per-identity manifests, for a process serving many principals. When
+        # set it is consulted before self.manifest — see scope_runtime.
+        self.manifest_store = manifest_store
         self.max_hash_bytes = max_hash_bytes
         # Content classification via the Zendata PII API. Runs only on the
         # background flush thread; see ai_telemetry/classification.py.
