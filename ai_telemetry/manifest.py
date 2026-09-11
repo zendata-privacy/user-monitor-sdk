@@ -223,6 +223,23 @@ class AgentCapabilityManifest:
         """
         return any(p.strip() == "*" for p in self.permitted_sources)
 
+    def declares_classifications(self) -> bool:
+        """Whether this manifest states a data clearance at all.
+
+        An empty ``permitted_classifications`` is "nobody said", not "cleared
+        for nothing" — and the difference is the whole signal. ``exceeds()``
+        compares against a set, so against an empty one EVERY class exceeds:
+        an identity roster with no clearance column produces a manifest that
+        fires SC_CLASSIFICATION_ESCALATION CRITICAL on the first event of every
+        principal. Measured on a real roster of 411 identities, that was 411
+        CRITICALs and 2,341 violations, none of them real.
+
+        This is the same failure ``is_enforceable()`` already guards for
+        sources, applied to the axis it was never applied to. Absence of a
+        declaration is not evidence of a breach.
+        """
+        return bool(self.permitted_classifications)
+
     def is_enforceable(self) -> bool:
         """True when this manifest can actually produce a source violation."""
         return bool(self.permitted_sources) and not self.is_unbounded()

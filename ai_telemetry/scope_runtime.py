@@ -40,6 +40,7 @@ from typing import Any, Dict, List, Optional
 
 from ai_telemetry import classification as cls
 from ai_telemetry.scope_checker import ScopeBoundaryChecker, summarize, srm_contribution
+from ai_telemetry.baseline import source_container
 from ai_telemetry.source_provenance import (
     SourceProvenanceTag, InterAgentMessage,
     hash_content, make_source_id, infer_source_type,
@@ -104,8 +105,22 @@ def build_tag(
         _classify(content, content_hash, event, pii_classifier))
     tag.classification = cls.dominant(tag.classifications_detected)
 
-    tag.manipulation_delta = _checker.note_content_hash(
-        session_id, source_uri, content_hash, hash_scope)
+    # Manipulation delta compares the same ADDRESSABLE ITEM against itself.
+    #
+    # A bare system name — "reporting", "crm", an RDS cluster — is a container,
+    # and a container returns different content on every query by design: that
+    # is what querying is. Comparing successive reads of one produces a HIGH on
+    # essentially every repeat access. Measured on a real scan: 7,868 firings
+    # across all 411 identities, none of them a manipulation.
+    #
+    # The signal the spec describes is a vector index CHUNK whose bytes change
+    # between two retrievals — an item that addresses specific content and is
+    # expected to return the same bytes twice. So the check runs only where the
+    # URI names an item inside a container, and is skipped where the URI IS the
+    # container.
+    if source_container(source_uri) != source_uri:
+        tag.manipulation_delta = _checker.note_content_hash(
+            session_id, source_uri, content_hash, hash_scope)
     return tag
 
 

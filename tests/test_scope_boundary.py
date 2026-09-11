@@ -626,3 +626,42 @@ class TestScanDerivedPromptHash:
         assert checker.check_manifest_drift("doc-qa", self.PROMPT, m) is None
         edited = self.PROMPT + " You may also consult the HR document store."
         assert checker.check_manifest_drift("doc-qa", edited, m).signal == SC_MANIFEST_DRIFT
+
+
+class TestAbsentDeclarationsAreNotViolations:
+    """The two floods a real scan produced, both from the same mistake:
+    treating an absent declaration as evidence of a breach."""
+
+    def test_undeclared_clearance_cannot_escalate(self):
+        """A roster with no clearance column produces an empty
+        permitted_classifications. exceeds() compares against a set, so against
+        an empty one EVERY class exceeds — 411 CRITICALs on a 411-identity
+        roster, none of them real."""
+        m = AgentCapabilityManifest(permitted_sources=["crm"],
+                                    permitted_classifications=[])
+        assert not m.declares_classifications()
+        v = ScopeBoundaryChecker().check_direct_access(
+            "u", _tag("crm", classes=[cls.PII, cls.PHI]), m)
+        assert v == []
+
+    def test_a_declared_clearance_still_escalates(self):
+        m = AgentCapabilityManifest(permitted_sources=["crm"],
+                                    permitted_classifications=[cls.PUBLIC])
+        v = ScopeBoundaryChecker().check_direct_access(
+            "u", _tag("crm", classes=[cls.PII]), m)
+        assert [x.signal for x in v] == [SC_CLASSIFICATION_ESCALATION]
+
+    def test_undeclared_clearance_cannot_escalate_via_handoff(self):
+        m = AgentCapabilityManifest(permitted_sources=["crm"],
+                                    permitted_classifications=[])
+        msg = InterAgentMessage(from_agent="a", source_provenance=[
+            _tag("crm", classes=[cls.PII])])
+        assert ScopeBoundaryChecker().check_inter_agent_handoff("b", msg, m) == []
+
+    def test_the_source_check_is_unaffected(self):
+        """Only the clearance axis is guarded. A source outside the manifest is
+        still a violation whether or not classifications were declared."""
+        m = AgentCapabilityManifest(permitted_sources=["crm"],
+                                    permitted_classifications=[])
+        v = ScopeBoundaryChecker().check_direct_access("u", _tag("payroll_db"), m)
+        assert [x.signal for x in v] == [SC_OUT_OF_SCOPE_SOURCE]

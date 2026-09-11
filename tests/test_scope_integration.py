@@ -447,3 +447,48 @@ def test_a_broken_scope_layer_never_breaks_telemetry(monkeypatch):
     client.capture(ev)
     client._send([ev])          # must not raise
     assert ev.event_type == "tool_call"
+
+
+class TestManipulationDeltaScope:
+    """A container returns different content on every query by design.
+
+    Comparing successive reads of one produced 7,868 HIGHs across 411
+    identities on a real scan — every repeat access of a system named
+    "reporting" or "crm". The signal is about an addressable ITEM whose bytes
+    are expected to be stable between two retrievals.
+    """
+
+    def test_a_system_name_never_reports_a_delta(self):
+        client, _ = _client(permitted_sources=["reporting"],
+                            permitted_classifications=["INTERNAL", "PUBLIC"])
+        current_user_context.set({"session_id": "s-sys"})
+        first = _flush(client, TelemetryEvent(
+            event_type="tool_call", source_uri="reporting", tool_output="Q1 rows"))
+        second = _flush(client, TelemetryEvent(
+            event_type="tool_call", source_uri="reporting", tool_output="Q2 rows"))
+        assert first.manipulation_delta is None
+        assert second.manipulation_delta is None
+        assert second.scope_signals is None
+
+    def test_an_addressable_item_still_reports_a_delta(self):
+        client, _ = _client(permitted_sources=["vector-index://kb"],
+                            permitted_classifications=["INTERNAL", "PUBLIC"])
+        current_user_context.set({"session_id": "s-item"})
+        uri = "vector-index://kb/chunk_id:vx_9"
+        _flush(client, TelemetryEvent(event_type="tool_call", source_uri=uri,
+                                      tool_output="original"))
+        second = _flush(client, TelemetryEvent(event_type="tool_call", source_uri=uri,
+                                               tool_output="injected"))
+        assert second.manipulation_delta is True
+        assert SC_SOURCE_MANIPULATION_DELTA in second.scope_signals
+
+    def test_an_s3_object_is_addressable(self):
+        client, _ = _client(permitted_sources=["arn:aws:s3:::docs"],
+                            permitted_classifications=["INTERNAL", "PUBLIC"])
+        current_user_context.set({"session_id": "s-s3"})
+        uri = "arn:aws:s3:::docs/policy.pdf"
+        _flush(client, TelemetryEvent(event_type="tool_call", source_uri=uri,
+                                      tool_output="v1"))
+        second = _flush(client, TelemetryEvent(event_type="tool_call", source_uri=uri,
+                                               tool_output="v2"))
+        assert second.manipulation_delta is True

@@ -202,7 +202,7 @@ class ScopeBoundaryChecker:
         # Every detected class is tested, not only the dominant one: content
         # carrying both PHI and PII reaching an agent cleared for PHI alone
         # would otherwise pass on the strength of its own label.
-        for detected in _classes_to_test(tag):
+        for detected in _classes_to_test(tag) if manifest.declares_classifications() else ():
             if cls.exceeds(detected, manifest.permitted_classifications):
                 violations.append(_violation(
                     SC_CLASSIFICATION_ESCALATION, CRITICAL,
@@ -274,7 +274,8 @@ class ScopeBoundaryChecker:
                     manifest_version=manifest.manifest_version,
                 ))
 
-            for detected in _classes_to_test(tag):
+            for detected in (_classes_to_test(tag)
+                             if manifest.declares_classifications() else ()):
                 if cls.exceeds(detected, manifest.permitted_classifications):
                     violations.append(_violation(
                         SC_CLASSIFICATION_ESCALATION, CRITICAL,
