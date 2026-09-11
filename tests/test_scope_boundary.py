@@ -330,46 +330,73 @@ class TestManifestDrift:
 # Manipulation delta
 # ---------------------------------------------------------------------------
 
+# An item inside a container. The signal compares specific content against
+# itself, so every test below has to name something addressable — a bare
+# container is refused by design.
+CHUNK = "vector-index://kb/chunk_id:vx_291"
+
+
 class TestManipulationDelta:
 
     def setup_method(self):
         self.checker = ScopeBoundaryChecker()
 
+    def test_a_container_is_never_compared_against_itself(self):
+        """The flood: 7,868 firings on a real scan. "reporting" and "crm" are
+        systems, and a system returns different content on every query — that
+        is what querying is. The refusal lives in note_content_hash so no
+        caller can reach the comparison by another route."""
+        h1, sc, _ = hash_content("Q1 rows")
+        h2, _, _ = hash_content("Q2 rows")
+        for container in ("reporting", "crm",
+                          "arn:aws:dynamodb:us-east-1:1:table/Customers",
+                          "arn:aws:secretsmanager:us-east-1:1:secret:db-AbCdEf"):
+            self.checker.note_content_hash("s", container, h1, sc)
+            assert self.checker.note_content_hash("s", container, h2, sc) is False, container
+
+    def test_an_item_inside_a_container_is_compared(self):
+        h1, sc, _ = hash_content("v1")
+        h2, _, _ = hash_content("v2")
+        for item in (CHUNK, "arn:aws:s3:::docs/policy.pdf",
+                     "https://api.example.com/v1/doc"):
+            self.checker.note_content_hash("s2", item, h1, sc)
+            assert self.checker.note_content_hash("s2", item, h2, sc) is True, item
+
     def test_first_retrieval_is_never_a_delta(self):
         h, scope, _ = hash_content("chunk text")
-        assert self.checker.note_content_hash("s1", "vx_291", h, scope) is False
+        assert self.checker.note_content_hash("s1", CHUNK, h, scope) is False
 
     def test_same_content_is_not_a_delta(self):
         h, scope, _ = hash_content("chunk text")
-        self.checker.note_content_hash("s1", "vx_291", h, scope)
-        assert self.checker.note_content_hash("s1", "vx_291", h, scope) is False
+        self.checker.note_content_hash("s1", CHUNK, h, scope)
+        assert self.checker.note_content_hash("s1", CHUNK, h, scope) is False
 
     def test_changed_content_is_a_delta(self):
         h1, s1, _ = hash_content("turn 3 content")
         h2, s2, _ = hash_content("turn 7 content — injected")
-        self.checker.note_content_hash("s1", "vx_291", h1, s1)
-        assert self.checker.note_content_hash("s1", "vx_291", h2, s2) is True
+        self.checker.note_content_hash("s1", CHUNK, h1, s1)
+        assert self.checker.note_content_hash("s1", CHUNK, h2, s2) is True
 
     def test_scope_mismatch_never_reports_a_delta(self):
         """Full on one turn, truncated on the next, is a size-cap artefact — not
         a manipulation. Reporting it would discredit the signal."""
         h1, _, _ = hash_content("x" * 10)
         h2, _, _ = hash_content("x" * 10)
-        self.checker.note_content_hash("s1", "vx", h1, HASH_SCOPE_FULL)
-        assert self.checker.note_content_hash("s1", "vx", h2, HASH_SCOPE_TRUNCATED) is False
+        self.checker.note_content_hash("s1", CHUNK, h1, HASH_SCOPE_FULL)
+        assert self.checker.note_content_hash("s1", CHUNK, h2, HASH_SCOPE_TRUNCATED) is False
 
     def test_sessions_do_not_bleed(self):
         h1, s, _ = hash_content("a")
         h2, _, _ = hash_content("b")
-        self.checker.note_content_hash("s1", "vx", h1, s)
-        assert self.checker.note_content_hash("s2", "vx", h2, s) is False
+        self.checker.note_content_hash("s1", CHUNK, h1, s)
+        assert self.checker.note_content_hash("s2", CHUNK, h2, s) is False
 
     def test_end_session_drops_state(self):
         h1, s, _ = hash_content("a")
         h2, _, _ = hash_content("b")
-        self.checker.note_content_hash("s1", "vx", h1, s)
+        self.checker.note_content_hash("s1", CHUNK, h1, s)
         self.checker.end_session("s1")
-        assert self.checker.note_content_hash("s1", "vx", h2, s) is False
+        assert self.checker.note_content_hash("s1", CHUNK, h2, s) is False
 
     def test_delta_flag_on_tag_fires_high(self):
         v = self.checker.check_direct_access(

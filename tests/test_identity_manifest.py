@@ -402,3 +402,80 @@ class TestPerIdentityManifests:
                             data_sources="crm", tool_output="x")
         client.capture(ev); client._send([ev])
         assert ev.scope_signals is None      # alice's own manifest permits crm
+
+
+class TestClearanceFromRoster:
+    """permitted_classifications must be READ, not just accepted as an argument.
+
+    The column existed in the roster and build_manifest ignored it, taking the
+    value only from a parameter nothing passed. Every manifest came back with an
+    empty clearance, which the SDK reads as "undeclared" and which therefore
+    suppresses SC_CLASSIFICATION_ESCALATION entirely — a boundary silently
+    missing an axis while the data to check it sat in the file.
+    """
+
+    def test_the_column_is_read(self):
+        m = build_manifest({"id": "a", "entitlements": "crm.read",
+                            "permitted_classifications": "PII|INTERNAL|PUBLIC"})
+        assert m.permitted_classifications == ["INTERNAL", "PII", "PUBLIC"]
+        assert m.declares_classifications()
+        assert m.derived_from["permitted_classifications"] == "identity_export"
+
+    def test_comma_separated_and_mixed_case(self):
+        m = build_manifest({"id": "a", "entitlements": "crm.read",
+                            "permitted_classifications": "pii, internal"})
+        assert m.permitted_classifications == ["INTERNAL", "PII"]
+
+    def test_an_explicit_argument_still_wins(self):
+        m = build_manifest({"id": "a", "entitlements": "crm.read",
+                            "permitted_classifications": "PII"},
+                           permitted_classifications=["PUBLIC"])
+        assert m.permitted_classifications == ["PUBLIC"]
+
+    def test_absence_stays_undeclared(self):
+        m = build_manifest({"id": "a", "entitlements": "crm.read"})
+        assert not m.declares_classifications()
+        assert m.derived_from["permitted_classifications"] == "not_declared"
+
+    def test_escalation_fires_from_a_roster_clearance(self):
+        from ai_telemetry.scope_checker import ScopeBoundaryChecker, SC_CLASSIFICATION_ESCALATION
+        from ai_telemetry.source_provenance import SourceProvenanceTag
+        m = build_manifest({"id": "a", "entitlements": "crm.read",
+                            "permitted_classifications": "INTERNAL|PUBLIC"})
+        v = ScopeBoundaryChecker().check_direct_access(
+            "a", SourceProvenanceTag(source_uri="crm", classification="PII",
+                                     classifications_detected=["PII"]), m)
+        assert [x.signal for x in v] == [SC_CLASSIFICATION_ESCALATION]
+
+
+@requires_fixtures
+class TestRosterProducesViolations:
+    """The demo must actually demonstrate. These pin both halves: the seeded
+    identities are caught, and the 384 normal ones are not."""
+
+    def _roster(self):
+        return {r["id"]: r for r in csv.DictReader(
+            open(IDENTITIES, newline="", encoding="utf-8"))}
+
+    def test_every_identity_declares_a_clearance(self):
+        for row in self._roster().values():
+            assert row["permitted_classifications"], row["id"]
+
+    def test_normal_identities_are_cleared_for_what_the_assistant_returns(self):
+        """The assistant hands the same content to every caller, so a clearance
+        narrower than that fires on nearly all of them — 216 normal identities
+        in the run that prompted this. A per-identity signal is the wrong shape
+        for a property of the corpus."""
+        for row in self._roster().values():
+            if row["scenario"] == "normal":
+                assert {"PII", "CREDENTIALS"} <= set(
+                    row["permitted_classifications"].split("|")), row["id"]
+
+    def test_seeded_identities_are_cleared_for_less_than_they_touch(self):
+        """Their narrowness IS the finding — the roster already says these 27
+        handle data above their grade."""
+        narrow = [r for r in self._roster().values()
+                  if r["scenario"] != "normal"
+                  and not {"PII", "CREDENTIALS"} <= set(
+                      r["permitted_classifications"].split("|"))]
+        assert len(narrow) >= 20

@@ -365,12 +365,29 @@ class ScopeBoundaryChecker:
     ) -> bool:
         """Record this retrieval's hash; return True if it changed.
 
-        Comparison is refused across differing hash scopes. A source read in
-        full on one turn and truncated on the next would otherwise report a
-        manipulation that is entirely an artefact of the size cap — the one
-        failure mode guaranteed to discredit the signal.
+        Two comparisons are refused, and both refusals are the signal working
+        rather than the signal missing.
+
+        **A container is never compared against itself.** A bare system name —
+        ``reporting``, ``crm``, an RDS cluster, a DynamoDB table — returns
+        different content on every query by design; that is what querying is.
+        Comparing successive reads of one produces a HIGH on essentially every
+        repeat access: measured on a real scan, 7,868 firings across 411
+        identities, none of them a manipulation. The signal the spec describes
+        is a vector index CHUNK whose bytes change between two retrievals — an
+        item that addresses specific content and is expected to return the same
+        bytes twice. This lives here rather than at the call site because it is
+        a property of the signal: any caller reaching the comparison by another
+        route would otherwise get the flood back.
+
+        **A truncated hash is never compared against a full one.** A source read
+        in full on one turn and capped on the next would otherwise report a
+        manipulation that is entirely an artefact of the size cap.
         """
         if not (session_id and source_uri and content_hash):
+            return False
+        from ai_telemetry.baseline import source_container
+        if source_container(source_uri) == source_uri:
             return False
         seen = self._session_hashes.setdefault(session_id, {})
         previous = seen.get(source_uri)

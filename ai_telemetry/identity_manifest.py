@@ -62,6 +62,12 @@ _FIELDS = {
     # observed baseline can never catch on its own.
     "system_prompt_hash": ("system_prompt_hash", "systemPromptHash",
                            "certified_prompt_hash"),
+    # The data classes this identity is cleared to handle. Without it the
+    # manifest declares no clearance, and an undeclared clearance suppresses
+    # SC_CLASSIFICATION_ESCALATION entirely — so a roster that states one and an
+    # adapter that ignores it produce a boundary silently missing an axis.
+    "permitted_classifications": ("permitted_classifications", "clearance",
+                                  "data_classifications", "permittedClassifications"),
 }
 
 
@@ -128,12 +134,20 @@ def build_manifest(
     agent_id = _pick(row, "id")
     entitled, by_resource = parse_entitlements(_pick(row, "entitlements"))
 
+    # An explicit argument wins; otherwise take what the roster states. Reading
+    # the column is the point of having it.
+    if permitted_classifications is None:
+        declared = _pick(row, "permitted_classifications")
+        permitted_classifications = [c for c in declared.replace(",", "|").split("|")
+                                     if c.strip()] if declared else None
+
     manifest = AgentCapabilityManifest(
         agent_id=agent_id,
         manifest_version=manifest_version,
         stated_purpose=_pick(row, "description"),
         permitted_sources=entitled,
-        permitted_classifications=sorted(permitted_classifications or []),
+        permitted_classifications=sorted(
+            {c.strip().upper() for c in (permitted_classifications or []) if c.strip()}),
         approved_by=_pick(row, "approved_by"),
         system_prompt_hash=_pick(row, "system_prompt_hash"),
         source_documents=[f"identity_export:{agent_id}"],
@@ -143,7 +157,7 @@ def build_manifest(
         "system_prompt_hash": ("identity_export" if manifest.system_prompt_hash
                                else "not_declared"),
         "permitted_classifications": (
-            "supplied" if permitted_classifications else "not_declared"),
+            "identity_export" if permitted_classifications else "not_declared"),
     }
     # Write-capable grants, kept as an onboarding observation rather than a
     # runtime signal. An agent entitled to write where its stated purpose is to
