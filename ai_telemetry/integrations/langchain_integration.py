@@ -145,7 +145,12 @@ def create_langchain_handler(telemetry: "TelemetryClient"):
 
             event = TelemetryEvent(
                 event_type="llm_call",
-                provider="openai",
+                # ZD-W3-07 · diligence. This was hardcoded "openai", which
+                # mislabels every non-OpenAI model reached through LangChain.
+                # The error hook 20 lines below already reports "langchain",
+                # and the TypeScript implementation of this same SDK reports
+                # "langchain" from both hooks. This branch was the outlier.
+                provider="langchain",
                 model=model_name,
                 latency_ms=latency_ms,
                 output_message={"role": "assistant", "content": output_text},
