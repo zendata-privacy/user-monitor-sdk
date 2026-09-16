@@ -33,8 +33,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           # ONE resolver pass -- see the note in the other workflows.
-          pip install pytest pytest-cov pip-licenses \
+          pip install pip-licenses \
             $([ -f requirements.txt ] && echo "-r requirements.txt")
+          # Test runner is dev tooling, not held to the runtime lock.
+          pip install --upgrade pytest pytest-cov
           pip install -e .
 
       - name: Tests and coverage
