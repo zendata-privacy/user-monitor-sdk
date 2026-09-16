@@ -32,8 +32,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-cov pip-licenses
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # ONE resolver pass -- see the note in the other workflows.
+          pip install pytest pytest-cov pip-licenses \
+            $([ -f requirements.txt ] && echo "-r requirements.txt")
           pip install -e .
 
       - name: Tests and coverage
@@ -47,7 +48,13 @@ jobs:
         run: |
           curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz \
             | tar -xz gitleaks
-          ./gitleaks git . --redact --exit-code 1
+          # `gitleaks dir` scans the WORKING TREE, not history. Deliberate: the
+          # gate's job is to stop a new secret entering the tree. History still
+          # contains credentials that were rotated and verified dead
+          # (_Diligence/evidence/secrets-scan-2026-09-15), and scanning it would
+          # fail every build until the separate history purge lands -- a gate
+          # that is always red teaches people to ignore it.
+          ./gitleaks dir . --redact --exit-code 1
 
       - name: Licence gate (no GPL in a proprietary product)
         run: |
