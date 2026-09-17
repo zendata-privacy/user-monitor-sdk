@@ -188,13 +188,42 @@ def get_drift_store() -> AgentDriftStore:
 def derive_zasp_score(event: "TelemetryEvent") -> Optional[float]:
     """Convert zendata_composite_risk (0–100 string) → ZASP safety score (0–10).
 
-    Higher ZASP score = safer.  Returns None when risk data is unavailable.
+    Higher ZASP score = safer.  Returns None when no risk data is available at
+    all.
+
+    Scope boundary violations are risk evidence and are deducted here. Without
+    this they would be invisible to the ZASP score and to every drift component
+    that reads it — an agent could ground an answer in data another agent was
+    never permitted to hand it and still report a clean safety score, which is
+    precisely the outcome the scope layer exists to prevent.
+
+    Note that a scope violation alone is enough to produce a score. The
+    composite risk field is populated by the Zendata evaluation engine and is
+    frequently absent; returning None in that case would discard a finding the
+    SDK made on its own evidence and is certain of.
     """
+    composite_score: Optional[float] = None
     try:
         composite = float(event.zendata_composite_risk or "")
-        return max(0.0, min(10.0, 10.0 - composite / 10.0))
+        composite_score = max(0.0, min(10.0, 10.0 - composite / 10.0))
     except (ValueError, TypeError):
-        return None
+        composite_score = None
+
+    penalty = 0.0
+    try:
+        from ai_telemetry.scope_checker import safety_penalty
+        penalty = safety_penalty(getattr(event, "scope_srm_weight", None))
+    except Exception:                                   # pragma: no cover
+        penalty = 0.0
+
+    if composite_score is None:
+        # No engine verdict. A clean event tells us nothing; a violation tells
+        # us a great deal, so only the second produces a score.
+        if penalty <= 0.0:
+            return None
+        return max(0.0, 10.0 - penalty)
+
+    return max(0.0, composite_score - penalty)
 
 
 # ---------------------------------------------------------------------------

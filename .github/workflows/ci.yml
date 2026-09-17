@@ -1,0 +1,104 @@
+# CI — the dual-language SDK: Python and TypeScript.
+#
+# ZD-W4-01/02/03/05 · diligence. This repository had NO CI at all, despite being
+# the best-covered component in the portfolio and the first thing a technical
+# evaluator runs. Both language halves are exercised here.
+
+name: CI
+
+on:
+  push:
+    branches: [main, development]
+  pull_request:
+    branches: [main, development]
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.10
+        # 3.10 is what the production image runs.
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # ONE resolver pass -- see the note in the other workflows.
+          pip install pip-licenses \
+            $([ -f requirements.txt ] && echo "-r requirements.txt")
+          # Test runner is dev tooling, not held to the runtime lock.
+          pip install --upgrade pytest pytest-cov
+          pip install -e .
+
+      - name: Tests and coverage
+        # Measured baseline with a point of rounding headroom. The signal-firing
+        # path the checklist actually names is far higher than this repo-wide
+        # figure - client.py 80%, detection.py 98%, decorators.py 97% - which is
+        # dragged down by large uncovered modules.
+        run: pytest --cov=ai_telemetry --cov-report=term --cov-fail-under=46
+
+      - name: Secret scan (gitleaks)
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz \
+            | tar -xz gitleaks
+          # `gitleaks dir` scans the WORKING TREE, not history. Deliberate: the
+          # gate's job is to stop a new secret entering the tree. History still
+          # contains credentials that were rotated and verified dead
+          # (_Diligence/evidence/secrets-scan-2026-09-15), and scanning it would
+          # fail every build until the separate history purge lands -- a gate
+          # that is always red teaches people to ignore it.
+          ./gitleaks dir . --redact --exit-code 1
+
+      - name: Licence gate (no GPL in a proprietary product)
+        run: |
+          pip-licenses --fail-on="GNU General Public License v2 (GPLv2)" \
+                       --fail-on="GNU General Public License v3 (GPLv3)" \
+                       --format=markdown > licence-report.md
+          cat licence-report.md
+
+      - name: Upload licence report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: licence-report-python-${{ github.sha }}
+          path: licence-report.md
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        # npm ci honours package-lock.json. node_modules is no longer vendored
+        # (ZD-W2-05), so this is now the only way the tree gets populated.
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Tests
+        # Must go through `npm test`. package.json sets "type": "module", so a
+        # bare `npx jest` fails on ESM without --experimental-vm-modules, which
+        # the test script already supplies.
+        run: npm test
+
+      - name: Licence gate (no GPL in a proprietary product)
+        run: |
+          npx license-checker --production --onlyAllow \
+            "MIT;ISC;Apache-2.0;BSD-2-Clause;BSD-3-Clause;0BSD;Unlicense;CC0-1.0;CC-BY-4.0;MIT-AND-Zlib;Python-2.0;BlueOak-1.0.0" \
+            --out licence-report-node.json
+          cat licence-report-node.json

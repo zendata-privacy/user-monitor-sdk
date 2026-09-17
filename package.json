@@ -1,6 +1,7 @@
 {
   "name": "ai-telemetry-sdk",
   "version": "1.0.0",
+  "private": true,
   "description": "AI application telemetry — capture prompts, completions, tool calls, tokens, and errors.",
   "type": "module",
   "main": "./dist/index.js",
@@ -41,7 +42,7 @@
     "anthropic",
     "langchain"
   ],
-  "license": "MIT",
+  "license": "UNLICENSED",
   "devDependencies": {
     "@types/jest": "^29.0.0",
     "@types/node": "^20.0.0",
