@@ -40,11 +40,16 @@ jobs:
           pip install -e .
 
       - name: Tests and coverage
-        # Measured baseline with a point of rounding headroom. The signal-firing
-        # path the checklist actually names is far higher than this repo-wide
-        # figure - client.py 80%, detection.py 98%, decorators.py 97% - which is
-        # dragged down by large uncovered modules.
-        run: pytest --cov=ai_telemetry --cov-report=term --cov-fail-under=46
+        # Baseline CI ACTUALLY MEASURES, with headroom -- not the local figure.
+        # Locally: 382 passed, 47.2%. In CI: 338 passed / 14 skipped, 44.14%.
+        # Thirty fewer tests run on a clean runner, so coverage legitimately
+        # falls. Calibrating from a developer machine made this gate red on its
+        # first run; the same mistake as ZD-W4-10.
+        #
+        # The signal-firing path the checklist actually names is far higher than
+        # this repo-wide figure - client.py 80%, detection.py 98%,
+        # decorators.py 97% - which is dragged down by large uncovered modules.
+        run: pytest --cov=ai_telemetry --cov-report=term --cov-fail-under=43
 
       - name: Secret scan (gitleaks)
         run: |
@@ -98,7 +103,12 @@ jobs:
 
       - name: Licence gate (no GPL in a proprietary product)
         run: |
-          npx license-checker --production --onlyAllow \
+          # --excludePackages skips THIS package. ZD-W2-03 set it to UNLICENSED,
+          # which is correct for a proprietary SDK and which no allowlist of
+          # open-source licences can legitimately contain. The gate is about
+          # third-party dependencies. Same fix as mobile in ZD-W4-08, which was
+          # not carried across to this workflow at the time.
+          npx license-checker --production --excludePackages "ai-telemetry-sdk@1.0.0" --onlyAllow \
             "MIT;ISC;Apache-2.0;BSD-2-Clause;BSD-3-Clause;0BSD;Unlicense;CC0-1.0;CC-BY-4.0;MIT-AND-Zlib;Python-2.0;BlueOak-1.0.0" \
             --out licence-report-node.json
           cat licence-report-node.json
