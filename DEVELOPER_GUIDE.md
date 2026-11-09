@@ -414,6 +414,49 @@ async def lifespan(app: FastAPI):
 
 ---
 
+## 3d. Connecting your chatbot to a Zendata Autonomous Workflow scan
+
+A Zendata **Autonomous Workflow** scan can score *your own* chatbot. Zendata sends it test
+traffic; your SDK ships the resulting telemetry to Zendata; the scan collects it.
+
+**1. Point the SDK at Zendata.** Copy the *Ingest endpoint* and *Project key* from step 4 of the
+Autonomous Workflow wizard (the key is per user and can only send telemetry):
+
+```python
+import os
+import ai_telemetry as telemetry
+
+os.environ.setdefault("ZENDATA_ENGINE_URL", "mock")   # built-in risk evaluator — without it
+                                                       # pii_detected / composite risk stay empty
+telemetry.init(
+    app_id="claims-bot",                               # the app_id your code declares
+    api_key=os.environ["ZENDATA_API_KEY"],             # the project key (zdi_…)
+    endpoint="https://dashboard.zendata.dev/api/telemetry/ingest",
+)
+```
+
+The SDK flushes every 5 s or every 20 events (`{"events": [...]}` with `X-API-Key`). Send your
+chatbot one message, wait ~10 s, then press **Run Connectivity Test** in the wizard.
+
+**2. Accept Zendata's test calls.** During the scan Zendata (from IP **3.84.255.108**) calls:
+
+| Call | Request | Your reply |
+|---|---|---|
+| Health check | `GET {url}/` | any status below 500 |
+| Each question | `POST {url}/chat` · `{"question": "...", "user_id": "<roster id>", "force_entity_type": null}` · optional auth header you configure | JSON `{"answer": "..."}` within 120 s |
+
+Up to 10 calls run in parallel; *calls per identity* (1–10) × the roster, capped at 500.
+
+**3. Attribute every call to its user.** Put the request's `user_id` into `current_user_context`
+before any LLM call (see Step 2 and §3c above) — the IDs come from the scan's identity roster, so
+events can be joined to identities. Keep the §3c pattern: capture the `user_message` event first,
+then honour `force_entity_type` (Zendata sends `null`, so the behavioural classifier runs).
+
+`ai_telemetry.export.write_events_csv()` is what the scan uses to turn the received events back
+into `events.csv` with exactly the columns this SDK writes locally.
+
+---
+
 ## 4. Extending the SDK (For Open Source Contributors)
 
 We welcome contributions to expand the ecosystem! Here is how you can contribute:
