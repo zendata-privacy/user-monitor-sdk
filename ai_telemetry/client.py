@@ -82,6 +82,10 @@ class TelemetryEvent:
     tool_input: Optional[Dict] = None
     tool_output: Optional[Any] = None
 
+    # Call type: transport protocol of the endpoint the call went to
+    # (https | http | grpc | grpcs | wss | ws | unix …). Empty when unknown.
+    call_protocol: Optional[str] = None
+
     # Error fields
     error_type: Optional[str] = None
     error_message: Optional[str] = None

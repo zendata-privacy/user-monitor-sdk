@@ -34,6 +34,7 @@ def trace_llm(
     telemetry: "TelemetryClient",
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    call_protocol: Optional[str] = None,
 ):
     """
     Decorator: wraps any function that calls an LLM and captures telemetry.
@@ -50,6 +51,7 @@ def trace_llm(
             event_type="llm_call" if not error_info else "error",
             model=model or "unknown",
             provider=provider or "generic",
+            call_protocol=call_protocol,
             latency_ms=latency_ms,
             metadata={"function": fn.__name__},
             user_id=user_ctx.get("user_id"),
@@ -116,6 +118,7 @@ def trace_tool(
     tool_name: Optional[str] = None,
     source_uri: Optional[str] = None,
     classification: Optional[str] = None,
+    call_protocol: Optional[str] = None,
 ):
     """
     Decorator: wraps any tool/function call and captures telemetry.
@@ -141,7 +144,14 @@ def trace_tool(
     CREDENTIALS, INTERNAL, PUBLIC) when the operator knows better than content
     inspection does — a table of pseudonymous ids that content scanning would
     read as clean, for instance.
+
+    ``call_protocol`` declares how the tool reaches its source (https, http,
+    grpc, …). When omitted it is taken from the scheme of ``source_uri``
+    (``https://…`` → https, ``postgres://…`` → postgres); an ARN or a plain
+    function leaves it empty.
     """
+    from ai_telemetry.transport import protocol_from_url
+    tool_protocol = call_protocol or protocol_from_url(source_uri)
     def _capture_tool_event(name, start, args, kwargs, result, error_info):
         from ai_telemetry.client import TelemetryEvent
         latency_ms = int((time.time() - start) * 1000)
@@ -160,6 +170,7 @@ def trace_tool(
         event = TelemetryEvent(
             event_type="tool_call" if not error_info else "error",
             tool_name=name,
+            call_protocol=tool_protocol,
             tool_input=_safe_serialize({"args": args, "kwargs": kwargs}),
             tool_output=_safe_serialize(result),
             latency_ms=latency_ms,

@@ -162,6 +162,7 @@ const rowCount = await traceTool(queryDatabase, telemetry)(sql);
 | Tool | `tool_name`, `tool_input`, `tool_output` |
 | Error | `error_type`, `error_message`, `error_stack` |
 | Trace | `trace_id`, `span_id`, `parent_span_id` |
+| Transport | `call_protocol` — scheme of the endpoint the call went to (`https`, `http`, …), from the client's `baseURL`; undefined when unknown |
 | Custom | `metadata` |
 
 ---

@@ -42,12 +42,21 @@ def create_langchain_handler(telemetry: "TelemetryClient"):
             super().__init__()
             self.telemetry = telemetry
             self._start_times: Dict[str, float] = {}
+            # run_id -> transport protocol of the model's endpoint (call_protocol)
+            self._protocols: Dict[str, str] = {}
 
         def _cleanup_start_times(self) -> None:
             now = time.time()
             stale = [k for k, v in self._start_times.items() if now - v > _MAX_START_TIME_AGE]
             for k in stale:
                 del self._start_times[k]
+                self._protocols.pop(k, None)
+
+        def _remember_protocol(self, run_id, serialized) -> None:
+            from ai_telemetry.transport import protocol_from_serialized
+            proto = protocol_from_serialized(serialized)
+            if proto:
+                self._protocols[str(run_id)] = proto
 
         # ------------------------------------------------------------------
         # LLM hooks
@@ -63,6 +72,7 @@ def create_langchain_handler(telemetry: "TelemetryClient"):
         ):
             self._cleanup_start_times()
             self._start_times[str(run_id)] = time.time()
+            self._remember_protocol(run_id, serialized)
 
         def on_chat_model_start(
             self,
@@ -74,6 +84,7 @@ def create_langchain_handler(telemetry: "TelemetryClient"):
         ):
             self._cleanup_start_times()
             self._start_times[str(run_id)] = time.time()
+            self._remember_protocol(run_id, serialized)
 
         def on_llm_end(
             self,
@@ -153,6 +164,7 @@ def create_langchain_handler(telemetry: "TelemetryClient"):
                 provider="langchain",
                 model=model_name,
                 latency_ms=latency_ms,
+                call_protocol=self._protocols.pop(str(run_id), None),
                 output_message={"role": "assistant", "content": output_text},
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
@@ -183,6 +195,7 @@ def create_langchain_handler(telemetry: "TelemetryClient"):
             event = TelemetryEvent(
                 event_type="error",
                 provider="langchain",
+                call_protocol=self._protocols.pop(str(run_id), None),
                 error_type=type(error).__name__,
                 error_message=str(error),
                 error_traceback=traceback.format_exc(),

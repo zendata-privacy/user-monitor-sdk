@@ -12,6 +12,7 @@
  */
 
 import type { TelemetryClient } from "../client.js";
+import { protocolOfClient } from "../transport.js";
 
 type AnyOpenAI = {
   chat: {
@@ -25,6 +26,7 @@ export function wrapOpenAI<T extends AnyOpenAI>(
   openai: T,
   telemetry: TelemetryClient
 ): T {
+  const callProtocol = protocolOfClient(openai);
   const originalCreate = openai.chat.completions.create.bind(
     openai.chat.completions
   );
@@ -59,6 +61,7 @@ export function wrapOpenAI<T extends AnyOpenAI>(
         provider: "openai",
         model,
         latency_ms,
+        ...(callProtocol ? { call_protocol: callProtocol } : {}),
         input_messages: messages,
         ...errorInfo,
       };

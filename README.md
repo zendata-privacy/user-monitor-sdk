@@ -394,6 +394,7 @@ async def chat_endpoint(request: ChatRequest):
 | `session_turn_index` | `int` | 0-based turn number within the session |
 | `inter_turn_latency_ms` | `int` | ms between the previous response and this submission |
 | `prompt_submission_time_ms` | `int` | Epoch ms when the prompt was received by the application |
+| `call_protocol` | `str` | Call type: transport protocol of the endpoint the call went to (`https`, `http`, `grpc`, `wss`, …), from the client's base URL; for tools, from `call_protocol=` or the scheme of `source_uri`. Empty when unknown; only the scheme is recorded |
 
 ### Classification signals reference
 

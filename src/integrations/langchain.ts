@@ -9,6 +9,7 @@
  */
 
 import type { TelemetryClient } from "../client.js";
+import { protocolOfClient } from "../transport.js";
 
 // Minimal interface — avoids a hard dep on @langchain/core
 interface LLMResult {
@@ -33,6 +34,7 @@ const MAX_START_TIME_AGE_MS = 300_000; // 5 minutes
 export class TelemetryCallbackHandler {
   private telemetry: TelemetryClient;
   private startTimes = new Map<string, number>();
+  private protocols = new Map<string, string>();
   private toolInputs = new Map<string, ToolInfo>();
 
   constructor(telemetry: TelemetryClient) {
@@ -44,6 +46,7 @@ export class TelemetryCallbackHandler {
     for (const [key, ts] of this.startTimes) {
       if (ts < cutoff) {
         this.startTimes.delete(key);
+        this.protocols.delete(key);
         this.toolInputs.delete(key); // no-op for LLM keys
       }
     }
@@ -51,18 +54,31 @@ export class TelemetryCallbackHandler {
 
   // LangChain callback interface methods -----------------------------------
 
-  handleLLMStart(_llm: unknown, _prompts: string[], runId: string) {
+  handleLLMStart(llm: unknown, _prompts: string[], runId: string) {
     this.cleanupStale();
     this.startTimes.set(runId, Date.now());
+    this.rememberProtocol(runId, llm);
+  }
+
+  private rememberProtocol(runId: string, llm: unknown) {
+    const p = protocolOfClient(llm);
+    if (p) this.protocols.set(runId, p);
+  }
+
+  private takeProtocol(runId: string): { call_protocol?: string } {
+    const p = this.protocols.get(runId);
+    this.protocols.delete(runId);
+    return p ? { call_protocol: p } : {};
   }
 
   handleChatModelStart(
-    _llm: unknown,
+    llm: unknown,
     _messages: unknown[][],
     runId: string
   ) {
     this.cleanupStale();
     this.startTimes.set(runId, Date.now());
+    this.rememberProtocol(runId, llm);
   }
 
   handleLLMEnd(output: LLMResult, runId: string) {
@@ -82,6 +98,7 @@ export class TelemetryCallbackHandler {
       prompt_tokens: usage.prompt_tokens,
       completion_tokens: usage.completion_tokens,
       total_tokens: usage.total_tokens,
+      ...this.takeProtocol(runId),
     });
   }
 
@@ -93,6 +110,7 @@ export class TelemetryCallbackHandler {
       error_type: error.constructor?.name ?? "Error",
       error_message: error.message,
       error_stack: error.stack,
+      ...this.takeProtocol(runId),
     });
   }
 

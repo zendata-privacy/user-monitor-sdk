@@ -47,6 +47,7 @@ def patch_openai(telemetry: "TelemetryClient"):
         raise ImportError("openai package is not installed. Run: pip install openai")
 
     from ai_telemetry.client import TelemetryEvent
+    from ai_telemetry.transport import protocol_of_client
 
     _original_create = openai.resources.chat.completions.Completions.create
 
@@ -79,6 +80,7 @@ def patch_openai(telemetry: "TelemetryClient"):
             )
 
             _capture_system_prompt_fields(event, messages, telemetry)
+            event.call_protocol = protocol_of_client(self_openai)
 
             if response is not None:
                 choice = response.choices[0] if response.choices else None
@@ -140,6 +142,7 @@ def patch_openai(telemetry: "TelemetryClient"):
             )
 
             _capture_system_prompt_fields(event, messages, telemetry)
+            event.call_protocol = protocol_of_client(self_openai)
 
             if response is not None:
                 choice = response.choices[0] if response.choices else None
