@@ -37,6 +37,13 @@ def test_protocol_of_sdk_resource_and_boto3_client():
 def test_protocol_from_langchain_serialized():
     assert protocol_from_serialized({"kwargs": {"openai_api_base": "http://proxy:4000"}}) == "http"
     assert protocol_from_serialized({"kwargs": {"model": "gpt-4o"}}) is None
+    # default endpoint of a known provider class (no URL configured)
+    assert protocol_from_serialized({"id": ["langchain", "chat_models", "openai", "ChatOpenAI"],
+                                     "kwargs": {"model_name": "gpt-4o"}}) == "https"
+    # a configured plain-http proxy still wins over the class default
+    assert protocol_from_serialized({"id": ["langchain", "chat_models", "openai", "ChatOpenAI"],
+                                     "kwargs": {"openai_api_base": "http://proxy:4000"}}) == "http"
+    assert protocol_from_serialized({"id": ["x", "SomeLocalLLM"], "kwargs": {}}) is None
 
 
 @pytest.fixture

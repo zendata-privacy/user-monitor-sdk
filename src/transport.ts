@@ -22,6 +22,21 @@ export function protocolFromUrl(url: unknown): string | undefined {
   return scheme.startsWith("http+unix") ? "unix" : scheme;
 }
 
+// LangChain model classes whose endpoint is fixed by the provider library when no
+// URL is configured; their protocol is that documented default. Mirrors transport.py.
+const DEFAULT_HTTPS_CLASSES = new Set([
+  "ChatOpenAI", "OpenAI", "OpenAIEmbeddings", "ChatAnthropic", "ChatBedrockConverse",
+  "BedrockChat", "ChatMistralAI", "ChatGoogleGenerativeAI", "ChatVertexAI", "ChatCohere", "ChatGroq",
+]);
+
+/** LangChain serialized model (`{ id: [..., "ChatOpenAI"], kwargs }`) → its default protocol. */
+export function defaultProtocolOfSerialized(obj: unknown): string | undefined {
+  if (!obj || typeof obj !== "object") return undefined;
+  const id = (obj as { id?: unknown }).id;
+  const cls = Array.isArray(id) && id.length ? String(id[id.length - 1]) : undefined;
+  return cls && DEFAULT_HTTPS_CLASSES.has(cls) ? "https" : undefined;
+}
+
 /** Protocol of the endpoint a client object (OpenAI, Anthropic, …) is bound to. */
 export function protocolOfClient(obj: unknown, depth = 0): string | undefined {
   if (!obj || typeof obj !== "object" || depth > 2) return undefined;

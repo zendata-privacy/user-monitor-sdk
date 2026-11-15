@@ -9,7 +9,7 @@
  */
 
 import type { TelemetryClient } from "../client.js";
-import { protocolOfClient } from "../transport.js";
+import { defaultProtocolOfSerialized, protocolOfClient } from "../transport.js";
 
 // Minimal interface — avoids a hard dep on @langchain/core
 interface LLMResult {
@@ -61,7 +61,7 @@ export class TelemetryCallbackHandler {
   }
 
   private rememberProtocol(runId: string, llm: unknown) {
-    const p = protocolOfClient(llm);
+    const p = protocolOfClient(llm) ?? defaultProtocolOfSerialized(llm);
     if (p) this.protocols.set(runId, p);
   }
 

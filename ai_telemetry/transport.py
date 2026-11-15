@@ -58,8 +58,23 @@ def protocol_of_client(obj: Any) -> Optional[str]:
     return None
 
 
+# LangChain model classes whose endpoint is fixed by the provider library when
+# no URL is configured (ChatOpenAI → https://api.openai.com, ChatAnthropic →
+# https://api.anthropic.com, Bedrock → https://bedrock-runtime.<region>…). For
+# these the protocol is the library's documented default, not a guess.
+_DEFAULT_HTTPS_CLASSES = {
+    "ChatOpenAI", "OpenAI", "OpenAIEmbeddings", "ChatAnthropic",
+    "ChatBedrock", "ChatBedrockConverse", "BedrockLLM", "ChatMistralAI",
+    "ChatGoogleGenerativeAI", "ChatVertexAI", "ChatCohere", "ChatGroq",
+}
+
+
 def protocol_from_serialized(serialized: Any) -> Optional[str]:
-    """Protocol from a LangChain ``serialized`` model description (its kwargs)."""
+    """Protocol from a LangChain ``serialized`` model description.
+
+    A configured URL in its kwargs wins; otherwise a known provider class with a
+    fixed default endpoint reports that endpoint's protocol (https).
+    """
     if not isinstance(serialized, dict):
         return None
     kwargs = serialized.get("kwargs") or {}
@@ -67,4 +82,8 @@ def protocol_from_serialized(serialized: Any) -> Optional[str]:
         proto = protocol_from_url(kwargs.get(attr))
         if proto:
             return proto
+    ident = serialized.get("id") or []
+    cls = ident[-1] if isinstance(ident, list) and ident else serialized.get("name")
+    if cls in _DEFAULT_HTTPS_CLASSES:
+        return "https"
     return None
