@@ -59,7 +59,9 @@ describe("traceLLM()", () => {
       client,
     );
     await fn();
-    expect(client.captured[0].latency_ms).toBeGreaterThanOrEqual(30);
+    // setTimeout(30) can fire a little early and Date.now() has 1 ms
+    // resolution, so 29 ms is a correct measurement of a 30 ms sleep.
+    expect(client.captured[0].latency_ms).toBeGreaterThanOrEqual(25);
   });
 
   it("captures error event and re-throws", async () => {
@@ -129,7 +131,9 @@ describe("traceTool()", () => {
       client,
     );
     await fn();
-    expect(client.captured[0].latency_ms).toBeGreaterThanOrEqual(30);
+    // setTimeout(30) can fire a little early and Date.now() has 1 ms
+    // resolution, so 29 ms is a correct measurement of a 30 ms sleep.
+    expect(client.captured[0].latency_ms).toBeGreaterThanOrEqual(25);
   });
 
   it("captures error event and re-throws", async () => {
