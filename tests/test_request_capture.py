@@ -303,3 +303,12 @@ def test_client_passes_the_callers_clearance(client):
     client.manifest_store = store
     assert client._clearance_for(TelemetryEvent(user_id="hr_user")) == {"PII", "INTERNAL"}
     assert client._clearance_for(TelemetryEvent(user_id="nobody")) is None
+
+
+def test_a_date_alone_does_not_raise_risk():
+    from ai_telemetry.integrations.zendata_integration import _mock_evaluate
+    e = TelemetryEvent(event_type="llm_call", sailpoint_risk="41", pii_types="DOB",
+                       output_message={"role": "assistant", "content": "as of 2026-11-02"})
+    _mock_evaluate(e, {"INTERNAL", "PUBLIC"})
+    assert e.zendata_composite_risk == "41"
+    assert "DOB" in e.pii_types

@@ -6,9 +6,13 @@ import urllib.error
 import urllib.parse
 from typing import TYPE_CHECKING
 
+# DOB is deliberately absent: the built-in labeller's DOB pattern matches any
+# ISO date (a value date, a hire date), so on structured data it fires on
+# nearly every record and would put every caller above the HIGH line. It is
+# still LABELLED; it just does not move the composite.
 _SENSITIVE_PII = frozenset({
     "SSN", "EMAIL", "EMAIL_ADDRESS", "ACCOUNT_NUMBER", "BANK_ACCOUNT", "IBAN",
-    "CREDIT_CARD", "CVV", "PASSPORT_NUMBER", "DRIVER_LICENSE", "DOB", "PASSWORD",
+    "CREDIT_CARD", "CVV", "PASSPORT_NUMBER", "DRIVER_LICENSE", "PASSWORD",
     "HEALTHCARE_NUMBER",
 })
 _EMAIL_PATTERN = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
