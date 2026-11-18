@@ -372,6 +372,15 @@ class TelemetryClient:
             if isinstance(headers, dict) and headers:
                 event.http_headers_digest = _digest_http_headers(headers)
 
+        # Trust boundary from DECLARED egress (context.record_egress), stamped
+        # here on the caller's thread because the evaluator that scores it runs
+        # on the flush thread, where the request context no longer exists.
+        # Hosts that declare nothing leave it unset and keep the evaluator's
+        # heuristic.
+        if event.trust_boundary_crossed is None and user_ctx.get("_request_acc") is not None:
+            from ai_telemetry.context import request_boundary_crossed
+            event.trust_boundary_crossed = request_boundary_crossed()
+
         forced_entity = user_ctx.get("force_entity_type")
 
         if event.event_type in ("llm_call", "user_message"):
@@ -497,7 +506,7 @@ class TelemetryClient:
                     print(f"[AI Telemetry] Scope evaluation error (non-fatal): {ex}")
 
             if event.event_type == "llm_call":
-                evaluate_event(event)
+                evaluate_event(event, permitted_classifications=self._clearance_for(event))
                 # Module 3 — build/update agent fingerprint for non-human callers
                 if event.entity_type in ("API CALL", "AGENT", "AMBIGUOUS"):
                     try:
@@ -559,6 +568,19 @@ class TelemetryClient:
             except Exception as ex:
                 if self.debug:
                     print(f"[AI Telemetry] JSONL write failed (non-fatal): {ex}")
+
+    def _clearance_for(self, event: TelemetryEvent):
+        """The data classes this event's caller is cleared for, or None when no
+        manifest declares any (an undeclared clearance is "nobody said", which
+        the evaluator must not read as "cleared for nothing")."""
+        try:
+            from ai_telemetry.scope_runtime import _manifest_for
+            manifest = _manifest_for(self, event, event.agent_id or self.app_id)
+        except Exception:
+            return None
+        if manifest is None or not manifest.declares_classifications():
+            return None
+        return set(manifest.permitted_classifications)
 
     @staticmethod
     def _pii_text(event: TelemetryEvent) -> str:

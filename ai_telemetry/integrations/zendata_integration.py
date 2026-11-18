@@ -16,7 +16,7 @@ _EMAIL_PATTERN = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 if TYPE_CHECKING:
     from ai_telemetry.client import TelemetryEvent
 
-def evaluate_event(event: "TelemetryEvent") -> None:
+def evaluate_event(event: "TelemetryEvent", permitted_classifications=None) -> None:
     """
     Evaluates the LLM interaction against the Zendata DLP & Security Engine.
     Enriches the event object with the results.
@@ -61,10 +61,18 @@ def evaluate_event(event: "TelemetryEvent") -> None:
             event.zendata_classification = result.get("zendata_classification", "Internal")
     except Exception as e:
         # Fallback Mock logic for demonstration/testing
-        _mock_evaluate(event)
+        _mock_evaluate(event, permitted_classifications)
 
 
-def _mock_evaluate(event: "TelemetryEvent") -> None:
+def _sensitive_classes(labels) -> set:
+    """Clearance classes (PII, CREDENTIALS, ...) of sensitive labels, whichever
+    labeller produced them (built-in regex names or PII API entity types)."""
+    from ai_telemetry.classification import classes_for_builtin_types, classes_for_entity_types
+    labels = list(labels)
+    return classes_for_builtin_types(labels) | classes_for_entity_types(labels)
+
+
+def _mock_evaluate(event: "TelemetryEvent", permitted_classifications=None) -> None:
     """Mock implementation for demonstration."""
     content = ""
     if event.input_messages:
@@ -94,10 +102,15 @@ def _mock_evaluate(event: "TelemetryEvent") -> None:
     # contains one, and bumping on them would make every conversation HIGH.
     sensitive = {t.upper() for t in merged} & _SENSITIVE_PII
 
-    # Determine trust boundary crossed
-    event.trust_boundary_crossed = False
-    if "external" in content or event.tools_called and "send_email" in event.tools_called:
-        event.trust_boundary_crossed = True
+    # Trust boundary. When the host declared where data went
+    # (context.record_egress), capture() already set it from that — e.g. an
+    # email to a colleague inside the organisation is not a crossing. Only for
+    # hosts that declare nothing does the old heuristic apply: the word
+    # "external" in the conversation, or send_email among the tools.
+    if event.trust_boundary_crossed is None:
+        event.trust_boundary_crossed = False
+        if "external" in content or event.tools_called and "send_email" in event.tools_called:
+            event.trust_boundary_crossed = True
         
     # Calculate composite risk
     base_risk = 0
@@ -107,8 +120,17 @@ def _mock_evaluate(event: "TelemetryEvent") -> None:
         pass
         
     composite_risk = base_risk
+    # Sensitive PII scores by CLEARANCE when the caller's is known: +30 when
+    # it is of a class the caller is not cleared for, +10 when it is (an HR
+    # officer reading an SSN in HR records is doing their job, but it is still
+    # sensitive data in flight). No declared clearance: +30, as before.
     if sensitive:
-        composite_risk += 30
+        if permitted_classifications is None:
+            composite_risk += 30
+        elif _sensitive_classes(sensitive) - set(permitted_classifications):
+            composite_risk += 30
+        else:
+            composite_risk += 10
     if event.trust_boundary_crossed:
         composite_risk += 40
         

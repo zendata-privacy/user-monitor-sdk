@@ -84,7 +84,7 @@ def start_request(**fields: Any) -> Dict[str, Any]:
     the caller's identity fields. Returns the context dict that was set.
     """
     ctx = dict(fields)
-    ctx[_ACC_KEY] = {"tools": [], "sources": [], "lock": threading.Lock()}
+    ctx[_ACC_KEY] = {"tools": [], "sources": [], "egress": [], "lock": threading.Lock()}
     current_user_context.set(ctx)
     return ctx
 
@@ -110,6 +110,32 @@ def record_sources(uris) -> None:
         for uri in uris or ():
             if uri and uri not in acc["sources"]:
                 acc["sources"].append(uri)
+
+
+def record_egress(destination: str, external: bool) -> None:
+    """Declare that this request sent data to *destination*.
+
+    ``external`` is the host's judgement of whether the destination is outside
+    its trust boundary (an email domain that is not the organisation's, a
+    third-party endpoint). Declaring it lets the SDK decide trust-boundary
+    crossings from what actually happened instead of guessing from a tool's
+    name or a word in the conversation.
+    """
+    acc = _acc()
+    if acc is None or not destination:
+        return
+    with acc["lock"]:
+        acc["egress"].append({"destination": destination, "external": bool(external)})
+
+
+def request_boundary_crossed() -> Optional[bool]:
+    """True if this request sent data outside the trust boundary so far;
+    False if it is tracked and has not; None when there is no accumulator."""
+    acc = _acc()
+    if acc is None:
+        return None
+    with acc["lock"]:
+        return any(e["external"] for e in acc["egress"])
 
 
 def request_tools() -> Optional[str]:

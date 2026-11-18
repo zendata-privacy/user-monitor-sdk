@@ -236,3 +236,70 @@ def test_pii_service_skips_system_prompt(client):
                                        {"role": "user", "content": "hello"}])
     client._label_with_pii_service(e)
     assert "SECRET SYSTEM" not in svc.entity_types.call_args[0][0]
+
+
+# ── 8. trust boundary from declared egress ──────────────────────────────────
+
+def test_internal_email_is_not_a_boundary_crossing(client):
+    from ai_telemetry.context import record_egress
+    from ai_telemetry.integrations.zendata_integration import _mock_evaluate
+    start_request(user_id="u8", tools_called="send_email")
+    record_egress("colleague@bank.example", external=False)
+    e = TelemetryEvent(event_type="llm_call", tools_called="send_email", sailpoint_risk="20")
+    client.capture(e)
+    _mock_evaluate(e)
+    assert e.trust_boundary_crossed is False
+    assert e.zendata_composite_risk == "20"
+
+
+def test_external_email_is_a_boundary_crossing(client):
+    from ai_telemetry.context import record_egress
+    from ai_telemetry.integrations.zendata_integration import _mock_evaluate
+    start_request(user_id="u9")
+    record_egress("colleague@bank.example", external=False)
+    record_egress("someone@partner.example", external=True)
+    e = TelemetryEvent(event_type="llm_call", tools_called="send_email", sailpoint_risk="20")
+    client.capture(e)
+    _mock_evaluate(e)
+    assert e.trust_boundary_crossed is True
+    assert e.zendata_composite_risk == "60"
+
+
+def test_without_declared_egress_the_heuristic_still_applies():
+    from ai_telemetry.integrations.zendata_integration import _mock_evaluate
+    e = TelemetryEvent(event_type="llm_call", tools_called="send_email", sailpoint_risk="20")
+    _mock_evaluate(e)
+    assert e.trust_boundary_crossed is True
+
+
+# ── 9. PII scored by clearance ──────────────────────────────────────────────
+
+@pytest.mark.parametrize("permitted, expected", [
+    (None, "50"),                                   # no declared clearance: +30 as before
+    ({"PII", "INTERNAL", "PUBLIC"}, "30"),           # cleared for SSN's class: +10
+    ({"INTERNAL", "PUBLIC"}, "50"),                  # not cleared: +30
+])
+def test_sensitive_pii_scored_by_clearance(permitted, expected):
+    from ai_telemetry.integrations.zendata_integration import _mock_evaluate
+    e = TelemetryEvent(event_type="llm_call", sailpoint_risk="20", pii_types="SSN",
+                       output_message={"role": "assistant", "content": "done"})
+    _mock_evaluate(e, permitted)
+    assert e.zendata_composite_risk == expected
+
+
+def test_account_number_needs_credentials_clearance():
+    from ai_telemetry.integrations.zendata_integration import _mock_evaluate
+    e = TelemetryEvent(event_type="llm_call", sailpoint_risk="20", pii_types="BANK_ACCOUNT",
+                       output_message={"role": "assistant", "content": "done"})
+    _mock_evaluate(e, {"PII", "INTERNAL", "PUBLIC"})
+    assert e.zendata_composite_risk == "50"
+
+
+def test_client_passes_the_callers_clearance(client):
+    from ai_telemetry.manifest import AgentCapabilityManifest
+    store = MagicMock()
+    store.get.side_effect = lambda k: AgentCapabilityManifest(
+        agent_id=k, permitted_classifications=["PII", "INTERNAL"]) if k == "hr_user" else None
+    client.manifest_store = store
+    assert client._clearance_for(TelemetryEvent(user_id="hr_user")) == {"PII", "INTERNAL"}
+    assert client._clearance_for(TelemetryEvent(user_id="nobody")) is None
