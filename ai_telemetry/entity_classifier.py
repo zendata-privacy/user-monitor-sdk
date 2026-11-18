@@ -558,6 +558,23 @@ def classify_event(
     now_ms = event.timestamp_ms
     state = store.get_or_create_session(session_id, entity_key)
 
+    # One submission, one turn. An agent answers a single user message with
+    # several LLM calls — a router, a tool loop, a final answer — and every one
+    # of them reaches here carrying the same prompt_text and submission time.
+    # Counting each as a new turn invented turns milliseconds apart with
+    # identical text: precisely the cadence that marks a MACHINE, so any human
+    # talking to a multi-step agent was pushed towards AGENT by the agent's own
+    # internals. Later calls for the same submission reuse its verdict.
+    if state.turns:
+        last = state.turns[-1]
+        if (last.verdict is not None and last.submission_time_ms == submission_ms
+                and last.prompt_text == prompt_text):
+            last.response_time_ms = now_ms
+            store.update_session(state)
+            for key, value in last.verdict.items():
+                setattr(event, key, value)
+            return
+
     # Record this call for rate-limit tracking (A1/A2)
     store.record_call(entity_key, now_ms)
 
@@ -699,3 +716,10 @@ def classify_event(
     event.session_turn_index = turn_index
     event.inter_turn_latency_ms = inter_turn_ms
     event.prompt_submission_time_ms = submission_ms
+
+    turn.verdict = {
+        k: getattr(event, k) for k in (
+            "entity_type", "entity_subtype", "caller_type_score", "classification_signals",
+            "behavioral_alerts", "session_turn_index", "inter_turn_latency_ms",
+            "prompt_submission_time_ms", "human_inferred_role", "human_role_confidence")
+    }

@@ -20,6 +20,10 @@ class TurnRecord:
     prompt_chars: int
     submission_time_ms: int    # when the user submitted the prompt
     response_time_ms: Optional[int] = None  # when the system returned its response
+    # The classification this submission received, so the further LLM calls an
+    # agent makes while answering the SAME submission (router, tool loop, final
+    # answer) reuse it instead of being counted as new turns. See classify_event.
+    verdict: Optional[dict] = None
 
 
 @dataclass

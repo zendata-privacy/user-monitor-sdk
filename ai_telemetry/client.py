@@ -302,9 +302,20 @@ class TelemetryClient:
         event.app_id = self.app_id
 
         # --- Module 1: always-on signal fields --------------------------------
-        # api_key_hash: attach unless the caller has already set it
+        # api_key_hash identifies the CALLER's credential (the field's own
+        # definition), and agent_id is derived from it. When the host knows
+        # which credential made this request — a service account's key on a
+        # machine endpoint — it puts it in the context and that is what is
+        # hashed. Falling back to the SDK's own ingest key, the previous and
+        # only behaviour, made every machine caller of a shared application the
+        # same agent, so per-agent baselines and drift could not exist.
         if not event.api_key_hash:
-            event.api_key_hash = self._api_key_hash
+            from ai_telemetry.context import current_user_context as _cuc
+            _ctx = _cuc.get() or {}
+            caller_key = _ctx.get("caller_api_key")
+            event.api_key_hash = (_ctx.get("caller_api_key_hash")
+                                  or (_sha256(str(caller_key)) if caller_key else None)
+                                  or self._api_key_hash)
 
         # build provenance: same contract as api_key_hash — attach unless the
         # caller set it. current_provenance() is lru_cached, so this is a tuple
@@ -464,6 +475,16 @@ class TelemetryClient:
         from ai_telemetry.agent_fingerprint import fingerprint_agent, get_fingerprint_store
         from ai_telemetry.drift_detector import analyze_drift, derive_zasp_score
         for event in events:
+            # Content labelling by the Zendata PII service, when configured.
+            # Background thread only (see PiiApiClassifier). Labels are MERGED
+            # into pii_types, never replacing the inline regex labels.
+            if self.pii_classifier is not None:
+                try:
+                    self._label_with_pii_service(event)
+                except Exception as ex:
+                    if self.debug:
+                        print(f"[AI Telemetry] PII service labelling error (non-fatal): {ex}")
+
             # Module 9 — source provenance and scope boundary. Runs for every
             # event type, not just llm_call: the retrieval that crosses a
             # boundary is a tool_call, and by the time the llm_call happens the
@@ -538,6 +559,36 @@ class TelemetryClient:
             except Exception as ex:
                 if self.debug:
                     print(f"[AI Telemetry] JSONL write failed (non-fatal): {ex}")
+
+    @staticmethod
+    def _pii_text(event: TelemetryEvent) -> str:
+        """The content of this event worth labelling: what the caller typed,
+        what tools returned, and what the model answered. The system prompt is
+        excluded — it is the application's own text, identical on every call."""
+        parts: List[str] = []
+        for msg in event.input_messages or ():
+            if isinstance(msg, dict) and msg.get("role") != "system" and msg.get("content"):
+                parts.append(str(msg["content"]))
+        if event.output_message and event.output_message.get("content"):
+            parts.append(str(event.output_message["content"]))
+        if event.tool_output is not None:
+            parts.append(event.tool_output if isinstance(event.tool_output, str) else str(event.tool_output))
+        return "\n".join(parts)
+
+    def _label_with_pii_service(self, event: TelemetryEvent) -> None:
+        if event.event_type not in ("llm_call", "tool_call", "user_message"):
+            return
+        text = self._pii_text(event)
+        if not text:
+            return
+        found = self.pii_classifier.entity_types(text, _sha256(text))
+        if not found:
+            if event.pii_detected is None:
+                event.pii_detected = False
+            return
+        existing = {t for t in (event.pii_types or "").split("|") if t}
+        event.pii_types = "|".join(sorted(existing | found))
+        event.pii_detected = True
 
     def _send_http(self, events: List[TelemetryEvent]):
         _MAX_RETRIES = 3

@@ -309,6 +309,15 @@ class PiiApiClassifier:
         look", which ``exceeds()`` treats as no violation — the SDK is not
         entitled to report a CRITICAL because its own dependency was down.
         """
+        return classes_for_entity_types(self.entity_types(text, content_hash))
+
+    def entity_types(self, text: str, content_hash: str) -> Set[str]:
+        """PII API entity type names present in *text* (SSN, NAME, ...).
+
+        The cache holds entity types rather than classes so the same lookup
+        serves both the scope layer (classes) and event labelling (pii_types).
+        Empty set on any failure; never raises (see ``classify``).
+        """
         if not text or not isinstance(text, str):
             return set()
 
@@ -318,15 +327,14 @@ class PiiApiClassifier:
             return set(hit)
 
         try:
-            entity_types = self._call(text[: self.max_chars])
+            types = self._call(text[: self.max_chars])
         except Exception as exc:                       # noqa: BLE001 — see docstring
             if self.debug:
                 print(f"[AI Telemetry] PII API classification skipped: {exc}")
             return set()
 
-        classes = classes_for_entity_types(entity_types)
-        self._remember(content_hash, classes)
-        return classes
+        self._remember(content_hash, types)
+        return types
 
     # ------------------------------------------------------------------
 

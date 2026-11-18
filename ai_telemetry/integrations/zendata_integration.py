@@ -6,6 +6,11 @@ import urllib.error
 import urllib.parse
 from typing import TYPE_CHECKING
 
+_SENSITIVE_PII = frozenset({
+    "SSN", "EMAIL", "EMAIL_ADDRESS", "ACCOUNT_NUMBER", "BANK_ACCOUNT", "IBAN",
+    "CREDIT_CARD", "CVV", "PASSPORT_NUMBER", "DRIVER_LICENSE", "DOB", "PASSWORD",
+    "HEALTHCARE_NUMBER",
+})
 _EMAIL_PATTERN = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 
 if TYPE_CHECKING:
@@ -73,10 +78,22 @@ def _mock_evaluate(event: "TelemetryEvent") -> None:
         pii_types.append("SSN")
     if _EMAIL_PATTERN.search(content):
         pii_types.append("Email")
-        
-    event.pii_detected = len(pii_types) > 0
-    event.pii_types = "|".join(pii_types)
-    
+
+    # Merge with labels already on the event (the inline regex labeller and the
+    # Zendata PII service). This used to OVERWRITE them, so a model-detected
+    # SSN or account number vanished from pii_types the moment the mock ran.
+    existing = [t for t in (event.pii_types or "").split("|") if t]
+    merged = sorted(set(existing) | set(pii_types))
+    event.pii_detected = bool(merged)
+    event.pii_types = "|".join(merged)
+
+    # The +30 composite bump is for SENSITIVE IDENTIFIERS — the class the mock
+    # always meant (SSN, email) — extended to the equivalent labels the regex
+    # labeller and PII service emit. Generic entities (NAME, DATE, ORGANIZATION,
+    # MONEY ...) are labelled but do not move risk: nearly every banking answer
+    # contains one, and bumping on them would make every conversation HIGH.
+    sensitive = {t.upper() for t in merged} & _SENSITIVE_PII
+
     # Determine trust boundary crossed
     event.trust_boundary_crossed = False
     if "external" in content or event.tools_called and "send_email" in event.tools_called:
@@ -90,7 +107,7 @@ def _mock_evaluate(event: "TelemetryEvent") -> None:
         pass
         
     composite_risk = base_risk
-    if event.pii_detected:
+    if sensitive:
         composite_risk += 30
     if event.trust_boundary_crossed:
         composite_risk += 40
