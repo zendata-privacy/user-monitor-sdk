@@ -54,6 +54,7 @@ def init(
     baseline_store: Optional[object] = None,
     manifest_store: Optional[object] = None,
     identity_roster: Optional[str] = None,
+    pii_concurrency: int = 4,
 ) -> TelemetryClient:
     """
     Initialize the AI Telemetry SDK.
@@ -129,6 +130,9 @@ def init(
                              content, which is what populates a provenance tag's
                              ``classification`` accurately. Called only on the
                              background flush thread, never on the caller's.
+        pii_concurrency:     PII API calls made at once per flush batch
+                             (default 4). One at a time caps labelling at about
+                             two events per second.
 
     Returns:
         TelemetryClient instance (also set as the module-level default).
@@ -201,6 +205,7 @@ def init(
         max_hash_bytes=max_hash_bytes,
         baseline_store=baseline_store,
         manifest_store=manifest_store,
+        pii_concurrency=pii_concurrency,
     )
     _default_client = client
 
