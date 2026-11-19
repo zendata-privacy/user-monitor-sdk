@@ -228,6 +228,7 @@ class TelemetryClient:
         baseline_store: Optional[Any] = None,
         manifest_store: Optional[Any] = None,
         pii_concurrency: int = 1,
+        pii_label_llm_input: bool = True,
     ):
         self.app_id = app_id
         self.api_key = api_key
@@ -271,6 +272,13 @@ class TelemetryClient:
         # and gets tasks replaced. Default 1; raise it to the service's task
         # count when that has been scaled for the load.
         self.pii_concurrency = max(1, int(pii_concurrency))
+        # An llm_call's input repeats the user's message and the tool results.
+        # When the host captures those as their own user_message / tool_call
+        # events (start_request + @trace_tool), they are labelled there, and
+        # sending them again with every model call more than doubles the PII
+        # API load. False labels only the model's answer on llm_call events.
+        # The inline classifier still labels every field of every event.
+        self.pii_label_llm_input = bool(pii_label_llm_input)
         # The soft boundary. Absent until a baseline store is supplied, and
         # every soft-boundary signal stays suppressed while it is — a baseline
         # is loaded from an offline build, never accumulated in process, so an
@@ -596,12 +604,14 @@ class TelemetryClient:
         return set(manifest.permitted_classifications)
 
     @staticmethod
-    def _pii_text(event: TelemetryEvent) -> str:
+    def _pii_text(event: TelemetryEvent, include_llm_input: bool = True) -> str:
         """The content of this event worth labelling: what the caller typed,
         what tools returned, and what the model answered. The system prompt is
-        excluded — it is the application's own text, identical on every call."""
+        excluded — it is the application's own text, identical on every call.
+        With include_llm_input=False an llm_call contributes only its answer."""
         parts: List[str] = []
-        for msg in event.input_messages or ():
+        skip_input = event.event_type == "llm_call" and not include_llm_input
+        for msg in () if skip_input else (event.input_messages or ()):
             if isinstance(msg, dict) and msg.get("role") != "system" and msg.get("content"):
                 parts.append(str(msg["content"]))
         if event.output_message and event.output_message.get("content"):
@@ -630,7 +640,7 @@ class TelemetryClient:
     def _label_with_pii_service(self, event: TelemetryEvent) -> None:
         if event.event_type not in ("llm_call", "tool_call", "user_message"):
             return
-        text = self._pii_text(event)
+        text = self._pii_text(event, self.pii_label_llm_input)
         if not text:
             return
         found = self.pii_classifier.entity_types(text, _sha256(text))

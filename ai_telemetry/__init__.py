@@ -55,6 +55,7 @@ def init(
     manifest_store: Optional[object] = None,
     identity_roster: Optional[str] = None,
     pii_concurrency: int = 1,
+    pii_label_llm_input: bool = True,
 ) -> TelemetryClient:
     """
     Initialize the AI Telemetry SDK.
@@ -135,6 +136,11 @@ def init(
                              per task at a time, so set this no higher than
                              its task count; one at a time caps labelling at
                              about two events per second.
+        pii_label_llm_input: Send an llm_call's input messages to the PII API
+                             (default True). Set False when user messages and
+                             tool results are captured as their own events
+                             (start_request + @trace_tool): they are labelled
+                             there, and only the model's answer is new.
 
     Returns:
         TelemetryClient instance (also set as the module-level default).
@@ -208,6 +214,7 @@ def init(
         baseline_store=baseline_store,
         manifest_store=manifest_store,
         pii_concurrency=pii_concurrency,
+        pii_label_llm_input=pii_label_llm_input,
     )
     _default_client = client
 
