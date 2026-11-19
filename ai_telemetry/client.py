@@ -227,6 +227,7 @@ class TelemetryClient:
         max_hash_bytes: Optional[int] = None,
         baseline_store: Optional[Any] = None,
         manifest_store: Optional[Any] = None,
+        pii_concurrency: int = 4,
     ):
         self.app_id = app_id
         self.api_key = api_key
@@ -263,6 +264,10 @@ class TelemetryClient:
             from ai_telemetry.classification import PiiApiClassifier
             self.pii_classifier = PiiApiClassifier(
                 api_key=pii_api_key, endpoint=pii_api_endpoint, debug=debug)
+        # PII API calls are network round trips (~0.5 s each). Made one at a
+        # time they cap labelling at ~2 events/s, far below what a busy host
+        # produces, so the flush thread falls behind and the queue overflows.
+        self.pii_concurrency = max(1, int(pii_concurrency))
         # The soft boundary. Absent until a baseline store is supplied, and
         # every soft-boundary signal stays suppressed while it is — a baseline
         # is loaded from an offline build, never accumulated in process, so an
@@ -453,14 +458,22 @@ class TelemetryClient:
                 print("[AI Telemetry] Queue full — dropping event")
 
     def flush(self):
-        """Flush all pending events synchronously."""
-        events = []
-        while not self._queue.empty():
-            try:
-                events.append(self._queue.get_nowait())
-            except queue.Empty:
-                break
-        if events:
+        """Flush all pending events synchronously, ``batch_size`` at a time.
+
+        Draining the whole queue into one ``_send`` made a busy host wait for
+        every queued event to be enriched before ANY of them was delivered, and
+        produced single POSTs of up to max_queue_size events. Sending each batch
+        as soon as it is enriched keeps delivery flowing and the queue short.
+        """
+        while True:
+            events = []
+            while len(events) < self.batch_size:
+                try:
+                    events.append(self._queue.get_nowait())
+                except queue.Empty:
+                    break
+            if not events:
+                return
             self._send(events)
 
     def shutdown(self):
@@ -483,16 +496,13 @@ class TelemetryClient:
         from ai_telemetry.integrations.zendata_integration import evaluate_event
         from ai_telemetry.agent_fingerprint import fingerprint_agent, get_fingerprint_store
         from ai_telemetry.drift_detector import analyze_drift, derive_zasp_score
+        # Content labelling by the Zendata PII service, when configured.
+        # Background thread only (see PiiApiClassifier). Labels are MERGED
+        # into pii_types, never replacing the inline regex labels. The calls for
+        # one batch run concurrently; each touches only its own event.
+        if self.pii_classifier is not None:
+            self._label_batch_with_pii_service(events)
         for event in events:
-            # Content labelling by the Zendata PII service, when configured.
-            # Background thread only (see PiiApiClassifier). Labels are MERGED
-            # into pii_types, never replacing the inline regex labels.
-            if self.pii_classifier is not None:
-                try:
-                    self._label_with_pii_service(event)
-                except Exception as ex:
-                    if self.debug:
-                        print(f"[AI Telemetry] PII service labelling error (non-fatal): {ex}")
 
             # Module 9 — source provenance and scope boundary. Runs for every
             # event type, not just llm_call: the retrieval that crosses a
@@ -596,6 +606,23 @@ class TelemetryClient:
         if event.tool_output is not None:
             parts.append(event.tool_output if isinstance(event.tool_output, str) else str(event.tool_output))
         return "\n".join(parts)
+
+    def _label_batch_with_pii_service(self, events: List[TelemetryEvent]) -> None:
+        def one(event: TelemetryEvent) -> None:
+            try:
+                self._label_with_pii_service(event)
+            except Exception as ex:
+                if self.debug:
+                    print(f"[AI Telemetry] PII service labelling error (non-fatal): {ex}")
+
+        workers = min(self.pii_concurrency, len(events))
+        if workers <= 1:
+            for event in events:
+                one(event)
+            return
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ai-telemetry-pii") as pool:
+            list(pool.map(one, events))
 
     def _label_with_pii_service(self, event: TelemetryEvent) -> None:
         if event.event_type not in ("llm_call", "tool_call", "user_message"):

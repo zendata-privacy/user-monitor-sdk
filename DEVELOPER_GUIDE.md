@@ -114,6 +114,7 @@ Main parameters (all are documented in the `init()` docstring):
 | `identity_roster` | `None` | Identity/entitlement CSV: one manifest per identity |
 | `system_prompt`, `permitted_sources`, `permitted_tools`, `permitted_classifications`, `prohibited_sources` | `None` | Declare a single agent's scope directly (no roster) |
 | `pii_api_key`, `pii_api_endpoint` | `None` | Zendata PII API labelling on the flush thread |
+| `pii_concurrency` | `4` | PII API calls made at once per flush batch |
 | `pii_redactor` | `None` | Your own redactor (masks and labels); otherwise the built-in classifier labels only (`classify_pii=True`) |
 | `auto_patch_openai`, `auto_patch_anthropic`, `auto_patch_boto3` | `False` | Auto-instrumentation; boto3 reports the real bucket/table/secret ARN as the source |
 | `baseline_path` / `baseline_store` | `None` | Offline baselines (`python -m ai_telemetry.baseline_builder`) for the soft scope boundary |
