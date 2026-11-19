@@ -258,3 +258,11 @@ class TestPiiLabellingConcurrency:
         assert len(calls) == 5
         assert all(e.pii_detected is False for e in events[1:])
         c.shutdown()
+
+
+def test_pii_concurrency_defaults_to_one(server_url):
+    # The PII service serves one request per task; a higher default would
+    # queue calls behind each other and starve its health checks.
+    c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url, flush_interval_s=999)
+    assert c.pii_concurrency == 1
+    c.shutdown()

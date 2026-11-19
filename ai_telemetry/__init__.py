@@ -54,7 +54,7 @@ def init(
     baseline_store: Optional[object] = None,
     manifest_store: Optional[object] = None,
     identity_roster: Optional[str] = None,
-    pii_concurrency: int = 4,
+    pii_concurrency: int = 1,
 ) -> TelemetryClient:
     """
     Initialize the AI Telemetry SDK.
@@ -131,8 +131,10 @@ def init(
                              ``classification`` accurately. Called only on the
                              background flush thread, never on the caller's.
         pii_concurrency:     PII API calls made at once per flush batch
-                             (default 4). One at a time caps labelling at about
-                             two events per second.
+                             (default 1). The PII service serves one request
+                             per task at a time, so set this no higher than
+                             its task count; one at a time caps labelling at
+                             about two events per second.
 
     Returns:
         TelemetryClient instance (also set as the module-level default).

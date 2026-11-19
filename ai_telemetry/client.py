@@ -227,7 +227,7 @@ class TelemetryClient:
         max_hash_bytes: Optional[int] = None,
         baseline_store: Optional[Any] = None,
         manifest_store: Optional[Any] = None,
-        pii_concurrency: int = 4,
+        pii_concurrency: int = 1,
     ):
         self.app_id = app_id
         self.api_key = api_key
@@ -264,9 +264,12 @@ class TelemetryClient:
             from ai_telemetry.classification import PiiApiClassifier
             self.pii_classifier = PiiApiClassifier(
                 api_key=pii_api_key, endpoint=pii_api_endpoint, debug=debug)
-        # PII API calls are network round trips (~0.5 s each). Made one at a
-        # time they cap labelling at ~2 events/s, far below what a busy host
-        # produces, so the flush thread falls behind and the queue overflows.
+        # PII API calls are network round trips (~0.5 s each), so one at a time
+        # caps labelling at ~2 events/s. The PII service handles ONE request per
+        # task at a time (scale with tasks, not threads): sending more calls at
+        # once than it has tasks only queues them, starves its health checks
+        # and gets tasks replaced. Default 1; raise it to the service's task
+        # count when that has been scaled for the load.
         self.pii_concurrency = max(1, int(pii_concurrency))
         # The soft boundary. Absent until a baseline store is supplied, and
         # every soft-boundary signal stays suppressed while it is — a baseline
