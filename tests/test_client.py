@@ -178,3 +178,83 @@ class TestShutdown:
         c.shutdown()
         c._thread.join(timeout=2)
         assert not c._thread.is_alive()
+
+
+class TestFlushBatching:
+    """flush() delivers batch_size events at a time, not the whole queue at once."""
+
+    def test_sends_in_batch_size_chunks(self, server_url):
+        c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url,
+                            batch_size=20, flush_interval_s=999)
+        sent = []
+        with patch.object(c, "_send_http", side_effect=lambda evs: sent.append(len(evs))):
+            for _ in range(45):
+                c.capture(TelemetryEvent(event_type="tool_call"))
+            c.flush()
+        assert sent == [20, 20, 5]
+        assert c._queue.qsize() == 0
+        c.shutdown()
+
+
+class _SlowPiiClassifier:
+    """Stands in for PiiApiClassifier: a 0.2 s round trip, counting overlap."""
+
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self.active = self.peak = self.calls = 0
+
+    def entity_types(self, text, content_hash):
+        with self._lock:
+            self.active += 1
+            self.calls += 1
+            self.peak = max(self.peak, self.active)
+        time.sleep(0.2)
+        with self._lock:
+            self.active -= 1
+        return {"SSN"}
+
+
+class TestPiiLabellingConcurrency:
+    def _client(self, server_url, concurrency):
+        c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url,
+                            flush_interval_s=999, pii_concurrency=concurrency)
+        c.pii_classifier = _SlowPiiClassifier()
+        return c
+
+    def _events(self, n):
+        return [TelemetryEvent(event_type="tool_call", tool_output=f"row {i}") for i in range(n)]
+
+    def test_calls_run_concurrently_and_label_every_event(self, server_url):
+        c = self._client(server_url, 4)
+        events = self._events(8)
+        start = time.perf_counter()
+        c._label_batch_with_pii_service(events)
+        elapsed = time.perf_counter() - start
+        assert c.pii_classifier.calls == 8
+        assert c.pii_classifier.peak == 4
+        assert elapsed < 1.0, f"8 calls of 0.2 s at concurrency 4 took {elapsed:.2f}s"
+        assert all(e.pii_detected is True and "SSN" in e.pii_types for e in events)
+        c.shutdown()
+
+    def test_concurrency_one_is_sequential(self, server_url):
+        c = self._client(server_url, 1)
+        c._label_batch_with_pii_service(self._events(3))
+        assert c.pii_classifier.peak == 1
+        c.shutdown()
+
+    def test_a_failing_call_does_not_stop_the_batch(self, server_url):
+        c = self._client(server_url, 4)
+        calls = []
+
+        def flaky(text, content_hash):
+            calls.append(text)
+            if text == "row 0":
+                raise RuntimeError("pii api down")
+            return set()
+        c.pii_classifier.entity_types = flaky
+        events = self._events(5)
+        c._label_batch_with_pii_service(events)
+        assert len(calls) == 5
+        assert all(e.pii_detected is False for e in events[1:])
+        c.shutdown()

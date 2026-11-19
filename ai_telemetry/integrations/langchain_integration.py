@@ -13,15 +13,29 @@ import traceback
 from typing import Any, Dict, List, Union, TYPE_CHECKING
 from uuid import UUID
 
+from ai_telemetry.client import _sha256
+
 if TYPE_CHECKING:
     from ai_telemetry.client import TelemetryClient
 
+# LangChain message type -> chat role
+_ROLE = {"system": "system", "human": "user", "ai": "assistant", "tool": "tool", "function": "tool"}
 
-def create_langchain_handler(telemetry: "TelemetryClient"):
+
+def create_langchain_handler(telemetry: "TelemetryClient", capture_tools: bool = True,
+                             agent_name: str = None):
     """
     Factory function that lazily imports langchain-core and returns a
     TelemetryCallbackHandler instance. Raises ImportError only when called,
     not at module import time.
+
+    capture_tools: set False when the tools are already wrapped with
+        ``@trace_tool`` — the decorator knows the tool's source and identity,
+        the callback only sees its output, and capturing both would emit two
+        tool_call events per call.
+    agent_name: the name of the agent this handler is attached to, recorded
+        as ``metadata["agent_name"]`` so a multi-agent application's events say
+        which of its agents made each LLM call.
     """
     try:
         from langchain_core.callbacks.base import BaseCallbackHandler
@@ -42,12 +56,24 @@ def create_langchain_handler(telemetry: "TelemetryClient"):
             super().__init__()
             self.telemetry = telemetry
             self._start_times: Dict[str, float] = {}
+            # run_id -> transport protocol of the model's endpoint (call_protocol)
+            self._protocols: Dict[str, str] = {}
+            # run_id -> the messages the model was called with (prompt capture)
+            self._inputs: Dict[str, List[Dict[str, Any]]] = {}
 
         def _cleanup_start_times(self) -> None:
             now = time.time()
             stale = [k for k, v in self._start_times.items() if now - v > _MAX_START_TIME_AGE]
             for k in stale:
                 del self._start_times[k]
+                self._protocols.pop(k, None)
+                self._inputs.pop(k, None)
+
+        def _remember_protocol(self, run_id, serialized) -> None:
+            from ai_telemetry.transport import protocol_from_serialized
+            proto = protocol_from_serialized(serialized)
+            if proto:
+                self._protocols[str(run_id)] = proto
 
         # ------------------------------------------------------------------
         # LLM hooks
@@ -63,6 +89,7 @@ def create_langchain_handler(telemetry: "TelemetryClient"):
         ):
             self._cleanup_start_times()
             self._start_times[str(run_id)] = time.time()
+            self._remember_protocol(run_id, serialized)
 
         def on_chat_model_start(
             self,
@@ -74,6 +101,15 @@ def create_langchain_handler(telemetry: "TelemetryClient"):
         ):
             self._cleanup_start_times()
             self._start_times[str(run_id)] = time.time()
+            self._remember_protocol(run_id, serialized)
+            # Prompt capture. The callback used to keep only the output, so no
+            # llm_call carried input_messages: PII typed INTO a prompt, and the
+            # system prompt the manifest-drift check compares, were never seen.
+            self._inputs[str(run_id)] = [
+                {"role": _ROLE.get(getattr(m, "type", ""), getattr(m, "type", "user")),
+                 "content": m.content if isinstance(m.content, str) else str(m.content)}
+                for batch in (messages or []) for m in batch
+            ]
 
         def on_llm_end(
             self,
@@ -142,12 +178,21 @@ def create_langchain_handler(telemetry: "TelemetryClient"):
 
             # Pull user context so entity classification and user fields are populated
             user_ctx = current_user_context.get()
+            from ai_telemetry.decorators import _request_or_ctx
+            inputs = self._inputs.pop(str(run_id), None)
+            system_prompt = next((m["content"] for m in inputs or () if m["role"] == "system"), None)
 
             event = TelemetryEvent(
                 event_type="llm_call",
-                provider="openai",
+                # ZD-W3-07 · diligence. This was hardcoded "openai", which
+                # mislabels every non-OpenAI model reached through LangChain.
+                # The error hook 20 lines below already reports "langchain",
+                # and the TypeScript implementation of this same SDK reports
+                # "langchain" from both hooks. This branch was the outlier.
+                provider="langchain",
                 model=model_name,
                 latency_ms=latency_ms,
+                call_protocol=self._protocols.pop(str(run_id), None),
                 output_message={"role": "assistant", "content": output_text},
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
@@ -159,9 +204,13 @@ def create_langchain_handler(telemetry: "TelemetryClient"):
                 department=user_ctx.get("department"),
                 job_title=user_ctx.get("job_title"),
                 sailpoint_risk=user_ctx.get("sailpoint_risk"),
-                data_sources=user_ctx.get("data_sources"),
-                tools_called=user_ctx.get("tools_called"),
+                data_sources=_request_or_ctx(user_ctx, "sources", "data_sources"),
+                tools_called=_request_or_ctx(user_ctx, "tools", "tools_called"),
                 prompt_submission_time_ms=user_ctx.get("prompt_submission_time_ms"),
+                session_id=user_ctx.get("session_id"),
+                input_messages=inputs,
+                system_prompt_hash=_sha256(system_prompt) if system_prompt else None,
+                metadata={"agent_name": agent_name} if agent_name else {},
             )
             self.telemetry.capture(event)
 
@@ -173,14 +222,22 @@ def create_langchain_handler(telemetry: "TelemetryClient"):
             **kwargs,
         ):
             from ai_telemetry.client import TelemetryEvent
+            from ai_telemetry.context import current_user_context
 
             self._start_times.pop(str(run_id), None)
+            self._inputs.pop(str(run_id), None)
+            user_ctx = current_user_context.get()
             event = TelemetryEvent(
                 event_type="error",
                 provider="langchain",
+                call_protocol=self._protocols.pop(str(run_id), None),
                 error_type=type(error).__name__,
                 error_message=str(error),
                 error_traceback=traceback.format_exc(),
+                # An error with no caller is an error nobody can attribute.
+                user_id=user_ctx.get("user_id"),
+                session_id=user_ctx.get("session_id"),
+                metadata={"agent_name": agent_name} if agent_name else {},
             )
             self.telemetry.capture(event)
 
@@ -236,7 +293,12 @@ def create_langchain_handler(telemetry: "TelemetryClient"):
             )
             self.telemetry.capture(event)
 
-    return TelemetryCallbackHandler()
+    handler = TelemetryCallbackHandler()
+    if not capture_tools:
+        handler.on_tool_start = lambda *a, **kw: None
+        handler.on_tool_end = lambda *a, **kw: None
+        handler.on_tool_error = lambda *a, **kw: None
+    return handler
 
 
 # Convenience alias so existing code using TelemetryCallbackHandler(telemetry)

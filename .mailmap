@@ -1,0 +1,79 @@
+# .mailmap — canonical contributor identities
+#
+# ZD-W2-04 · diligence. `git log` across the estate yields 41 distinct author
+# identities for roughly 28 people. Section 4 of the diligence checklist (IP
+# Ownership) needs a contributor list that a reviewer can act on, and 41
+# strangers is not that — the same person appears as a personal address, a
+# GitHub noreply alias, and sometimes a laptop hostname.
+#
+# This file is presentation only. It changes what `git log` DISPLAYS; it does
+# not rewrite history, alter a commit, or change authorship of anything. It is
+# the technical input to Pedro's IP assignment register, not a substitute for
+# it: every person below still needs a signed agreement.
+#
+# Verify with:
+#     git log --format='%aN <%aE>' --all | sort -u | wc -l
+#
+# Identical in every in-scope repository so the register is one list, not 12.
+#
+# ── Zendata ─────────────────────────────────────────────────────────────────
+Rubens Zimbres <rubenszmm@gmail.com> <rubenszmm@gmail.com>
+Alex Carneiro <acarneiro@zendata.xyz> <acarneiro@zendata.xyz>
+Alex Carneiro <acarneiro@zendata.xyz> <165022106+acarneirozen@users.noreply.github.com>
+
+# ── Talpor ──────────────────────────────────────────────────────────────────
+Pedro Pinango <ppinango@talpor.com> <ppinango@talpor.com>
+
+# ── Caramel Point ───────────────────────────────────────────────────────────
+Pablo Ameri <pablo@caramelpoint.com> <pablo@caramelpoint.com>
+Pablo Ameri <pablo@caramelpoint.com> <97031797+PabloOAmeri@users.noreply.github.com>
+Bruno Bertoni <bruno@caramelpoint.com> <bruno@caramelpoint.com>
+Bruno Bertoni <bruno@caramelpoint.com> <89985125+brunocaramel@users.noreply.github.com>
+Emanuel Perr <emanuel@caramelpoint.com> <emanuel@caramelpoint.com>
+Emanuel Perr <emanuel@caramelpoint.com> <86308957+emaperr@users.noreply.github.com>
+Facu Rossi <facundo@caramelpoint.com> <facundo@caramelpoint.com>
+Facu Rossi <facundo@caramelpoint.com> <72609940+facucaramelpoint@users.noreply.github.com>
+Enzo Letona <enzo@caramelpoint.com> <enzo@caramelpoint.com>
+Enzo Letona <enzo@caramelpoint.com> <81968607+EnzoLetona@users.noreply.github.com>
+Leandro Falugi <leandro.falugi@caramelpoint.com> <leandro.falugi@caramelpoint.com>
+
+# ── Addepto ─────────────────────────────────────────────────────────────────
+Patryk Palej <patryk.palej@addepto.com> <patryk.palej@addepto.com>
+Adam Składanek <adam.skladanek@addepto.com> <adam.skladanek@addepto.com>
+Adam Składanek <adam.skladanek@addepto.com> <askl@askl.addepto>
+Vadym Mariiechko <vadym.mariiechko@addepto.com> <vadym.mariiechko@addepto.com>
+
+# ── Stimyapp ────────────────────────────────────────────────────────────────
+Wojciech Drezek <wojciech@stimyapp.com> <wojciech@stimyapp.com>
+Wojciech Drezek <wojciech@stimyapp.com> <wojciechdrezek@protonmail.com>
+Wojciech Drezek <wojciech@stimyapp.com> <142996378+wojciechdrezeknn@users.noreply.github.com>
+
+# ── Individual contributors ─────────────────────────────────────────────────
+Douglas Tavares <tavares-douglas@outlook.com> <tavares-douglas@outlook.com>
+Douglas Tavares <tavares-douglas@outlook.com> <141359836+DouglasTavare@users.noreply.github.com>
+Douglas Tavares <tavares-douglas@outlook.com> <douglastavares@Douglass-MacBook-Air.local>
+Maycol Teles <maycolteles@hotmail.com> <maycolteles@hotmail.com>
+Allan Sales <allanmsales@gmail.com> <allanmsales@gmail.com>
+Allan Sales <allanmsales@gmail.com> <75844054+allanmsales@users.noreply.github.com>
+Agustin Prado <agustin.prado79@gmail.com> <agustin.prado79@gmail.com>
+Agustin Prado <agustin.prado79@gmail.com> <agustinprado@Agustins-MacBook-Pro-2.local>
+
+# ── UNRESOLVED — each needs a name, a current address, and an agreement ─────
+# These are collapsed to one identity each where the alias is unambiguous, but
+# the canonical address is a placeholder. Pedro: these are the chases.
+#
+# TODO(IP): Allan Rivalles — three aliases, no corporate or stable personal
+#           address. Which address should the register use?
+Allan Rivalles <allanrivalles@icloud.com> <allanrivalles@icloud.com>
+Allan Rivalles <allanrivalles@icloud.com> <allanrivalles@Allans-MacBook-Pro.local>
+Allan Rivalles <allanrivalles@icloud.com> <107001620+allanrivalles-gh@users.noreply.github.com>
+#
+# TODO(IP): inductivebias777 — 38 commits. A developer who has since left; the
+#           GitHub account is deleted (the "-del" suffix). Needs a real name
+#           before an agreement can be sought. Highest-risk gap in section 4:
+#           volume of work, no name, and the person is gone.
+#
+# TODO(IP): Marcin Marczyk — 1 commit, committed only from a laptop hostname
+#           (macOS-009.local). Needs a real address and the engaging firm.
+#
+# TODO(IP): abhijeetlokhande1996 — 2 commits, a handle with no name attached.

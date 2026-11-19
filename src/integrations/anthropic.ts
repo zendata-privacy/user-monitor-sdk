@@ -12,6 +12,7 @@
  */
 
 import type { TelemetryClient } from "../client.js";
+import { protocolOfClient } from "../transport.js";
 
 type AnyAnthropic = {
   messages: {
@@ -23,6 +24,7 @@ export function wrapAnthropic<T extends AnyAnthropic>(
   anthropic: T,
   telemetry: TelemetryClient
 ): T {
+  const callProtocol = protocolOfClient(anthropic);
   const originalCreate = anthropic.messages.create.bind(anthropic.messages);
 
   anthropic.messages.create = async function (...args: unknown[]) {
@@ -55,6 +57,7 @@ export function wrapAnthropic<T extends AnyAnthropic>(
         provider: "anthropic",
         model,
         latency_ms,
+        ...(callProtocol ? { call_protocol: callProtocol } : {}),
         input_messages: messages,
         ...errorInfo,
       };

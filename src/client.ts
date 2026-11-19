@@ -26,6 +26,10 @@ export interface TelemetryEvent {
   tool_input?: Record<string, unknown>;
   tool_output?: unknown;
 
+  // Call type: transport protocol of the endpoint the call went to
+  // ("https" | "http" | "grpc" | "wss" | …). Undefined when unknown.
+  call_protocol?: string;
+
   // Error fields
   error_type?: string;
   error_message?: string;

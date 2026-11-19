@@ -1,104 +1,167 @@
 # AI Telemetry SDK: Developer & Contributor Guide
 
-Welcome to the AI Telemetry SDK Developer Guide. This document provides a deep dive into the architecture, design patterns, and extensibility of the SDK. It is intended for developers integrating the SDK into their enterprise applications, as well as open-source contributors looking to extend its capabilities.
+This guide covers the SDK's architecture, how to integrate it into an application, and how
+to extend it. It describes the code in `ai_telemetry/` as of November 2026.
+
+> **Integrating a client application?** The short, step-by-step version is
+> [`docs/CLIENT_INTEGRATION.md`](docs/CLIENT_INTEGRATION.md). This guide goes deeper.
 
 ---
 
 ## 1. Architectural Overview
 
-The AI Telemetry SDK is designed to be a **zero-dependency, non-blocking, and highly extensible** observation layer for LLM applications.
+The SDK is a **zero-dependency, non-blocking** observation layer for LLM applications.
 
 ### Core Design Principles
-1. **Asynchronous Dispatch**: Telemetry tracking should never block the main application thread. Events are queued and flushed in a background thread.
-2. **Context-Awareness**: Telemetry isn't just about latency; it's about *who* is doing *what*. The SDK uses Python's `contextvars` to seamlessly weave user identity and access risk into low-level LLM calls.
-3. **Security-First (Zendata Integration)**: Native support for real-time payload inspection (DLP) and risk classification before logs are finalized.
+1. **Non-blocking**: `capture()` only does cheap, in-memory work on the caller's thread
+   and enqueues the event. Network calls (Zendata evaluation, PII API, ingest) run on a
+   background flush thread.
+2. **Context-aware**: the SDK uses Python `contextvars` plus a per-request accumulator
+   (`start_request()`) to attach *who* made a request, *which tools* ran and *which
+   sources* they read, even when an agent framework runs tools on worker threads.
+3. **Declared, not guessed**: data sources (`source_uri`), egress (`record_egress`) and
+   entitlements (identity roster) are declared by the host application. The SDK never
+   infers a source from a tool's name.
 
-### Component Diagram
+### Data Flow
 
 ```text
-[ FastAPI / Flask Request ] --> Sets `current_user_context`
-       │
-       ▼
-[ @trace_tool / @trace_llm ] --> Executes target function, captures latency/tokens
-       │
-       ▼
-[ TelemetryClient.capture() ] --> 1. Intercepts payload
-       │                          2. Calls Zendata DLP Engine (if configured)
-       │                          3. Enqueues enriched TelemetryEvent
-       ▼
-[ Background Flush Thread ] ----> Periodically flushes Queue
-       │
-       ├──> Local CSV Writer (`logs/events.csv`)
-       └──> HTTP POST to Remote Dashboard Endpoint
+[ Request ] --> start_request(user_id=…, prompt_text=…, …)      (per-request context)
+     │
+     ▼
+[ @trace_tool / @trace_llm / LangChain handler / auto-patchers ]
+     │   tools and sources recorded in the request accumulator;
+     │   record_egress() declares data leaving the organisation
+     ▼
+[ TelemetryClient.capture(event) ]  — caller's thread, no network
+     │   1. api_key_hash, build provenance, trace/span ids, session_id
+     │   2. ip_hash / http_headers_digest (raw values never kept)
+     │   3. trust_boundary_crossed from declared egress
+     │   4. entity classification (llm_call, user_message); tool_call inherits
+     │   5. PII labelling (inline classifier or your pii_redactor)
+     │   6. strip content if capture_prompts=False, then enqueue
+     ▼
+[ Background flush thread ]  — every flush_interval_s (5 s) or batch_size (20) events
+     │   1. Zendata PII API labelling (if pii_api_key is set)
+     │   2. scope evaluation: sources vs the identity's manifest (every event type)
+     │   3. llm_call only: Zendata risk evaluation, agent fingerprint,
+     │      behavioural drift + ZASP score (non-human callers)
+     ▼
+     ├──> HTTP POST {"events": [...]} to `endpoint`, header X-API-Key   (primary)
+     └──> Local CSV + JSONL (only when enable_local_log=True)          (optional)
 ```
 
 ---
 
 ## 2. Core Components
 
-### `TelemetryEvent` (`ai_telemetry/client.py`)
-A `dataclass` representing a single unit of work. It captures:
-* **Execution Metrics:** Latency, tokens, model, provider.
-* **Payload Data:** Prompts, responses, tool inputs/outputs (unless `capture_prompts=False`).
-* **User Context:** Populated automatically from the context store (e-mail, department, sailpoint_risk).
-* **Security Analytics:** Populated via Zendata (PII types, trust boundary, composite risk).
-
-### `TelemetryClient` (`ai_telemetry/client.py`)
-The engine of the SDK. It manages a thread-safe `queue.Queue` and a daemon thread that wakes up every `flush_interval_s` (or when the application shuts down) to batch-write logs to disk and dispatch them to a remote HTTP endpoint.
-
-### `current_user_context` (`ai_telemetry/context.py`)
-Uses `contextvars.ContextVar`. In asynchronous frameworks like FastAPI, standard global variables leak across concurrent requests. `ContextVar` ensures that deep within the call stack, the SDK retrieves the exact user identity associated with the current HTTP request.
-
-### `evaluate_event` (`ai_telemetry/integrations/zendata_integration.py`)
-An interceptor that takes a pending `TelemetryEvent` of type `llm_call`, sends the prompt and completion to the Zendata Security Engine, and enriches the event with PII and risk classifications.
+| Component | File | Role |
+|---|---|---|
+| `init()` | `ai_telemetry/__init__.py` | Builds the client, the manifest store (identity roster) and optional auto-patches |
+| `TelemetryEvent` | `client.py` | Dataclass for one event: metrics, payload, caller context, security signals |
+| `TelemetryClient` | `client.py` | Queue, `capture()`, background flush (`_send`), HTTP and local-log writers |
+| `current_user_context`, `start_request`, `record_egress`, `source_context`, `TraceContext` | `context.py` | Per-request identity, accumulator, declared egress and sources, trace ids |
+| `trace_tool`, `trace_llm` | `decorators.py` | Wrap tools and model calls |
+| `create_langchain_handler` | `integrations/langchain_integration.py` | LangChain callback handler |
+| `patch_openai` / `patch_anthropic` / `patch_boto3` | `integrations/` | Auto-instrumentation (`auto_patch_*` in `init()`) |
+| `evaluate_event` | `integrations/zendata_integration.py` | Zendata risk evaluation (PII, trust boundary, composite risk) |
+| Identity manifests | `identity_manifest.py`, `manifest.py`, `scope_runtime.py`, `scope_checker.py` | Per-identity scope from the roster; hard boundary checks |
+| Entity classifier | `entity_classifier.py`, `session_state.py` | HUMAN / AGENT / API CALL / AMBIGUOUS |
+| Agent fingerprint, drift, roles | `agent_fingerprint.py`, `drift_detector.py`, `role_inference.py`, `baseline.py` | Learned behaviour per agent and per human role |
+| Persistence | `persistence.py` | Save / restore learned state as JSON |
+| Export | `export.py` | `write_events_csv()`: events back to the local CSV format |
 
 ---
 
 ## 3. Implementation Guide for Developers
 
+### Step 0: Install
+
+The SDK is not on PyPI. Install it from this repository's folder:
+
+```bash
+pip install /path/to/user-monitor-sdk               # core
+pip install "/path/to/user-monitor-sdk[langchain]"  # + extras: openai, anthropic, langchain, all
+```
+
 ### Step 1: Initialization
-Initialize the client as early as possible in your application lifecycle (e.g., FastAPI `@asynccontextmanager lifespan`).
+
+Initialise once at startup, before any request is served:
 
 ```python
+import os
 import ai_telemetry as telemetry
 
 telemetry.init(
     app_id="my-app",
-    api_key="sk-...",          # For remote ingest
-    debug=True,                # Enable console logging for SDK activity
-    capture_prompts=True       # Disable to strip PII before it even reaches Zendata
+    api_key=os.environ["ZENDATA_API_KEY"],
+    endpoint="https://dashboard.zendata.dev/api/telemetry/ingest",
+    capture_prompts=True,                       # False strips content (PII labels survive)
+    identity_roster="config/identities.csv",    # one scope per identity (see §3e)
+    pii_api_key=os.environ.get("PII_API_KEY"),
+    pii_api_endpoint=os.environ.get("PII_API_URL"),
+    debug=False,
 )
 ```
 
-### Step 2: Context Injection (Middleware / Routers)
-Whenever a request enters your system, populate the context variable. The decorators will pick this up automatically.
+Main parameters (all are documented in the `init()` docstring):
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `app_id`, `api_key` | required | Application id and ingest key |
+| `endpoint` | `https://ingest.zendata.dev/v1/events` | Ingest URL |
+| `capture_prompts` | `True` | `False` removes prompt, response and tool payloads |
+| `identity_roster` | `None` | Identity/entitlement CSV: one manifest per identity |
+| `system_prompt`, `permitted_sources`, `permitted_tools`, `permitted_classifications`, `prohibited_sources` | `None` | Declare a single agent's scope directly (no roster) |
+| `pii_api_key`, `pii_api_endpoint` | `None` | Zendata PII API labelling on the flush thread |
+| `pii_concurrency` | `4` | PII API calls made at once per flush batch |
+| `pii_redactor` | `None` | Your own redactor (masks and labels); otherwise the built-in classifier labels only (`classify_pii=True`) |
+| `auto_patch_openai`, `auto_patch_anthropic`, `auto_patch_boto3` | `False` | Auto-instrumentation; boto3 reports the real bucket/table/secret ARN as the source |
+| `baseline_path` / `baseline_store` | `None` | Offline baselines (`python -m ai_telemetry.baseline_builder`) for the soft scope boundary |
+| `enable_local_log`, `log_path` | `False`, `None` | Local CSV + JSONL; default path `$ZENDATA_LOG_DIR/events.csv` (or the temp dir) |
+| `debug` | `False` | Print SDK diagnostics |
+
+### Step 2: Context Injection (once per request)
+
+Open each request with `start_request()` **before** any LLM or tool call:
 
 ```python
 import time
-from ai_telemetry.context import current_user_context
+from ai_telemetry.context import TraceContext, start_request
 
 @app.post("/chat")
-async def chat_endpoint(request: Request):
-    user_data = {
-        "user_id": "usr_999",
-        "email": "dev@bank.com",
-        "department": "Engineering",
-        "sailpoint_risk": "10",
-        "tools_called": "",     # Initialize empty state for this request
-
-        # Required for entity classification — must be set at the request boundary,
-        # before any LLM call is made.
-        "prompt_text":               request.question,          # raw user input
-        "prompt_submission_time_ms": int(time.time() * 1000),   # epoch ms at receipt
-    }
-    # Set context safely for this specific async task
-    current_user_context.set(user_data)
-
-    # ... execute LLM logic ...
+async def chat(req: ChatRequest, request: Request):
+    start_request(
+        user_id=req.user_id,                                  # roster id
+        email="…", display_name="…", department="…",
+        job_title="…", sailpoint_risk="…",
+        session_id=req.session_id,                            # conversation id (optional)
+        prompt_text=req.question,                             # raw user input
+        prompt_submission_time_ms=int(time.time() * 1000),    # when it arrived
+        ip_address=request.client.host if request.client else None,
+        http_headers=dict(request.headers),                   # hashed, never stored raw
+    )
+    TraceContext.start_trace()
+    ...
 ```
 
+`start_request()` sets `current_user_context` **and** creates the request accumulator. Tools
+record themselves and their sources into it from any thread, so every later event of the
+request carries `tools_called` and the sources read. Setting `current_user_context`
+directly still works, but tools run on other threads (LangChain's executor, for example)
+are then invisible to later events.
+
+Optional context keys the SDK reads:
+
+| Key | Effect |
+|---|---|
+| `session_id` | Groups turns into one session (default: `user_id`) |
+| `prompt_text`, `prompt_submission_time_ms` | Required by the entity classifier |
+| `ip_address`, `http_headers` | Hashed into `ip_hash`, `http_headers_digest` |
+| `caller_api_key` / `caller_api_key_hash` | Identifies a machine caller's credential (gives each agent its own `agent_id`) |
+| `force_entity_type` | Forces the label on `llm_call` and `tool_call` events (see §3c) |
+
 ### Step 3: Decorating Functions
-Use `@trace_llm` for model calls and `@trace_tool` for functional tools (like RAG retrievers, DB queries, or API calls).
 
 ```python
 from ai_telemetry.decorators import trace_llm, trace_tool
@@ -106,304 +169,225 @@ import ai_telemetry as telemetry
 
 t = telemetry.get_client()
 
-@trace_tool(t, tool_name="fetch_customer_data")
-def get_customer(id: str):
-    # This automatically appends "fetch_customer_data" to the
-    # 'tools_called' string in the current_user_context!
-    pass
+@trace_tool(t, tool_name="lookup_account",
+            source_uri="accounts_db/customers", call_protocol="postgres")
+def lookup_account(customer_id: str) -> dict: ...
 
-@trace_llm(t, model="gpt-4", provider="openai")
-def generate_response(prompt: str):
-    # When this completes, it captures latency, reads 'tools_called',
-    # and invokes Zendata DLP before queuing the event.
-    pass
+def _source(args, kwargs, result):              # source known only at call time
+    return f"{kwargs['resource']}/records"
+
+@trace_tool(t, tool_name="search_records", source_uri=_source)
+def search_records(resource: str, query: str) -> list: ...
+
+@trace_llm(t, model="gpt-4o", provider="openai")
+def generate_response(prompt: str): ...
 ```
+
+`trace_tool(telemetry, tool_name=None, source_uri=None, classification=None, call_protocol=None)`:
+
+- `source_uri`: a string, or a callable `(args, kwargs, result) -> str | list | None`.
+  This is what the scope check compares against the identity's entitlements.
+- `classification`: pins what the tool returns (`PII`, `PHI`, `CREDENTIALS`, `INTERNAL`, `PUBLIC`).
+- `call_protocol`: taken from the `source_uri` scheme when omitted.
+
+For sources known only inside the function, wrap the read:
+`with source_context("vector-index://kb/chunk_id:42"): ...`
+
+For data that leaves the organisation, declare it inside the tool:
+`record_egress("mailto:a@other.com", external=True)`. The SDK sets
+`trust_boundary_crossed` from these declarations instead of guessing.
 
 ### Step 4: Graceful Shutdown
-Always flush the queue on app termination so you don't lose the last few events in memory.
 
 ```python
-telemetry.get_client().shutdown()
+telemetry.get_client().shutdown()     # flushes the queue
 ```
 
----
-
+For short-lived processes, carry learned state between runs (see §3f).
 
 ---
 
 ## 3b. Entity Classification (Human vs. Agent Detection)
 
-The SDK ships a built-in classifier that analyses every `llm_call` event and tags it as
-**HUMAN**, **AUTOMATED**, **AGENT**, or **UNKNOWN** using 15 behavioral rules.  
-Results appear as new fields on `TelemetryEvent` and in `logs/events.csv`.
+The classifier tags each `llm_call` and `user_message` event as **HUMAN**, **AGENT**,
+**API CALL** (automated, non-delegating caller), **AMBIGUOUS** or **UNKNOWN**. `tool_call`
+events inherit the session's label. Results appear as fields on `TelemetryEvent`
+(`entity_type`, `entity_subtype`, `classification_signals`, `behavioral_alerts`,
+`session_turn_index`, `inter_turn_latency_ms`).
 
 ### What the classifier needs from your application
-
-The classifier needs two pieces of information that only your application layer can provide:
 
 | Key | Type | Description |
 |---|---|---|
 | `prompt_text` | `str` | The raw prompt the user submitted (not the full messages array) |
-| `prompt_submission_time_ms` | `int` | Epoch milliseconds at the moment the request was received |
+| `prompt_submission_time_ms` | `int` | Epoch milliseconds when the request was received |
 
-Both must be set inside `current_user_context` **before** any LLM call executes.  
-See **Step 2** above for the exact placement.
+Both go into the request context (Step 2) **before** any LLM call. Without `prompt_text`
+the classifier does not run.
 
-> **Why not infer these inside the SDK?**  
-> The SDK patches LLM clients at the network level. By the time a patch fires, the LLM  
-> call has already started — the submission timestamp is gone, and `input_messages` may  
-> contain injected system prompts that would distort prompt-structure analysis.  
-> Your application is the only place that sees the clean, original user input in time.
+> **Why not infer these inside the SDK?** By the time a patched LLM call fires, the
+> submission time is gone and `input_messages` may contain injected system prompts.
+> Only your application sees the clean user input in time.
 
 ### How classification works
 
 ```text
-TelemetryClient.capture(event)          ← called by auto-patcher
+TelemetryClient.capture(event)
        │
-       ├── reads current_user_context
-       │     └── prompt_text, prompt_submission_time_ms, user_id
-       │
-       ├── resolves SessionState (keyed on trace_id)
-       │     └── turn history, established entity type, probe scores
-       │
-       ├── runs all 15 rules (T1–T3, P1/P4, S1/S4, A1/A2, M1, D1–D5)
-       │     └── each returns a list of signal strings
-       │
-       ├── votes on entity_type from signals
-       │     AGENT wins if M1 fires; otherwise AUTOMATED vs HUMAN by vote count
-       │
-       ├── writes entity_type, classification_signals, behavioral_alerts
-       │   session_turn_index, inter_turn_latency_ms onto the event
-       │
-       └── updates SessionState (turns, baselines, probe scores)
+       ├── reads current_user_context: prompt_text, prompt_submission_time_ms, user_id, session_id
+       ├── resolves SessionState (keyed on session_id, default user_id)
+       ├── runs the rules (T1–T3, T5, T6, P1, P4, S1, S2, S4, A1, A2, B1, M1, D1–D5)
+       ├── per-turn score = 0.5 + Σ signal weights; session score = EMA of turns
+       │     3+ strong automation signals on one turn → score forced to 0.20
+       ├── score < 0.25 → AGENT if M1 (delegation language) fired, else API CALL
+       │   score > 0.75 → HUMAN;  otherwise AMBIGUOUS
+       └── writes the result onto the event and updates SessionState
 ```
 
-### Session state
+### Session state and persistence
 
-State is maintained in memory by `ai_telemetry.session_state.SessionStore` (a module-level
-singleton). Each session is keyed on `trace_id`; entity-level call-rate history is keyed
-on `user_id`.
-
-State is **not persisted** across process restarts. If you need cross-restart baselines
-(e.g. for D1 drift detection), seed the store at startup by replaying recent risk scores
-from your own datastore into `store.update_baseline(entity_key, score)`.
+Session state lives in memory (`ai_telemetry.session_state`, via `get_session_store()`).
+Learned state (drift baselines, agent fingerprints, human role evidence, per-identity risk
+baselines) can be saved and restored with `ai_telemetry.persistence` (§3f). Individual
+conversations are deliberately not persisted.
 
 ### Testing the classifier locally
 
 ```python
-import time, sys
-sys.path.insert(0, "user-monitor-sdk")
-
+import time
 from ai_telemetry.session_state import SessionStore
 from ai_telemetry.entity_classifier import classify_event
 from ai_telemetry.client import TelemetryEvent
 
 store = SessionStore()
 
-# Simulate an automated agent prompt
-event = TelemetryEvent(event_type="llm_call", sailpoint_risk="10", trace_id="t1")
-classify_event(
-    event, store,
-    session_id="t1",
-    entity_key="usr_001",
-    prompt_text="Return only JSON. Do not include any explanation. Format as {\"result\": ...}",
-    submission_ms=int(time.time() * 1000) - 50,   # 50 ms — below human threshold
-)
-print(event.entity_type)             # AUTOMATED
-print(event.classification_signals)  # T1_SUBMISSION_VELOCITY|P4_IMPERATIVE_FRAMING|...
+# An automated caller: fast, templated, imperative prompts in one session.
+for i in range(3):
+    e = TelemetryEvent(event_type="llm_call", trace_id=f"b{i}")
+    classify_event(e, store, session_id="batch", entity_key="svc_001",
+                   prompt_text=f'Return only JSON. Do not include any explanation. Format as {{"id": {i}}}',
+                   submission_ms=int(time.time() * 1000) - 50)
+    print(e.entity_type)       # AMBIGUOUS, AMBIGUOUS, API CALL
 
-# Simulate a multi-agent delegation prompt
-event2 = TelemetryEvent(event_type="llm_call", sailpoint_risk="10", trace_id="t2")
-classify_event(
-    event2, store,
-    session_id="t2",
-    entity_key="agent_007",
-    prompt_text="Your task is to extract all account numbers from the tool result below.",
-    submission_ms=int(time.time() * 1000) - 80,
-)
-print(event2.entity_type)      # AGENT
-print(event2.entity_subtype)   # SUBAGENT_RECEIVER
+# A delegating agent: M1 delegation language.
+e2 = TelemetryEvent(event_type="llm_call", trace_id="t2")
+classify_event(e2, store, session_id="t2", entity_key="agent_007",
+               prompt_text="Your task is to extract all account numbers from the tool result below.",
+               submission_ms=int(time.time() * 1000) - 80)
+print(e2.entity_type, e2.entity_subtype)   # AGENT SUBAGENT_RECEIVER
 ```
+
+A single templated turn usually stays AMBIGUOUS; the label settles as the session
+accumulates turns.
 
 ### Extending the classifier
 
-The classifier lives in `ai_telemetry/entity_classifier.py`. Each rule is a standalone
-function (`_check_T1`, `_check_P4`, etc.) that takes a `SessionState` and relevant inputs
-and returns a list of signal strings. To add a new rule:
+Each rule in `ai_telemetry/entity_classifier.py` is a standalone `_check_XX(...)` function
+returning a list of signal strings. To add one:
 
-1. Write a `_check_XX(...)` function that returns `["MY_SIGNAL"]` or `[]`.
-2. Add `"MY_SIGNAL"` to `_AUTOMATED_SIGNALS`, `_HUMAN_SIGNALS`, or `_ALERT_MAP`
-   depending on what it indicates.
-3. Call your function inside `classify_event()` and append its result to `all_signals`.
+1. Write `_check_XX(...)` returning `["MY_SIGNAL"]` or `[]`.
+2. Give the signal a weight in `_SIGNAL_WEIGHTS` (negative = automation, positive = human),
+   and add it to `_ALERT_MAP` if it should raise a behavioural alert.
+3. Call it inside `classify_event()` and append its result to the signal list.
 
 ---
 
 ## 3c. Full Integration Checklist for Application Developers
 
-This section consolidates every change your application code must make for the SDK to work correctly end-to-end — correct entity classification, human turn capture, and proper separation between real user traffic and synthetic test traffic.
+### 1. Install the SDK
 
-### 1. Make the SDK importable
+`pip install /path/to/user-monitor-sdk` (Step 0). The older `sys.path.insert(...)`
+approach still works for local experiments but is not recommended for deployments.
 
-The SDK is a local package (`user-monitor-sdk/`). Add it to `sys.path` **at the very top of your entry point**, before any other import, so it works regardless of how the server is launched (uvicorn, gunicorn, pytest, etc.):
+### 2. Add `force_entity_type` to your request model (optional)
 
-```python
-# app/main.py  — must be the first lines of the file
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "user-monitor-sdk"))
-
-# All other imports follow
-import ai_telemetry as telemetry
-from ai_telemetry.client import TelemetryEvent
-from ai_telemetry.context import current_user_context
-```
-
-> **Why not `pip install -e`?**
-> Editable installs require `setuptools >= 64` with `editable-mode = "compat"` and write
-> access to site-packages. The `sys.path.insert` approach works universally, survives
-> folder renames, and requires no installation step.
-
----
-
-### 2. Add `force_entity_type` to your request model
-
-Add an optional field that defaults to `"AGENT"` for real chatbot traffic, but lets synthetic test scripts opt out by passing `null`:
+When your chatbot's own LLM calls should always be labelled AGENT, accept a field that
+defaults to `"AGENT"` and lets test scripts opt out with `null`:
 
 ```python
-from pydantic import BaseModel
-from typing import Optional
-
 class QueryRequest(BaseModel):
     question: str
     user_id: Optional[str] = "usr_default"
     force_entity_type: Optional[str] = "AGENT"
-    # ^ Default "AGENT": all LangChain internal calls (llm_call, tool_call) in a real
-    #   chatbot session are agent-pipeline events and should be labelled accordingly.
-    # ^ Pass null from synthetic test scripts to let the behavioral classifier run
-    #   naturally and produce HUMAN / AUTOMATED classifications instead.
 ```
 
----
+`force_entity_type` applies to `llm_call` and `tool_call` events only. `user_message`
+events are always classified from behaviour.
 
-### 3. Capture a `user_message` event before setting `force_entity_type`
-
-This is the critical two-phase pattern. The `user_message` event represents the human's turn and **must be captured before** `force_entity_type` is placed in the context — otherwise the override would suppress natural behavioural classification for the human turn too.
+### 3. Capture a `user_message` event at the start of each request
 
 ```python
 @app.post("/chat")
-async def chat(request: QueryRequest, http_request: Request):
-    # ── Phase 1: build context WITHOUT force_entity_type ──────────────────
-    user_data = {
-        "user_id":                   request.user_id,
-        "email":                     "...",
-        "display_name":              "...",
-        "department":                "...",
-        "job_title":                 "...",
-        "sailpoint_risk":            "0",
-        "tools_called":              "",
-        "data_sources":              "crm_db|docs_store",
+async def chat(req: QueryRequest, request: Request):
+    # Phase 1: open the request (no force_entity_type yet)
+    ctx = start_request(
+        user_id=req.user_id, email="…", display_name="…", department="…",
+        job_title="…", sailpoint_risk="0",
+        prompt_text=req.question,
+        prompt_submission_time_ms=int(time.time() * 1000),
+    )
+    TraceContext.start_trace()
 
-        # Required by the entity classifier — must reflect the raw user input
-        # and the exact moment the request arrived, before any LLM work starts.
-        "prompt_text":               request.question,
-        "prompt_submission_time_ms": int(time.time() * 1000),
-    }
-    current_user_context.set(user_data)
-
-    # ── Phase 2: capture the human turn ───────────────────────────────────
-    # No force_entity_type in context yet → the behavioural classifier runs
-    # naturally and labels this event HUMAN (or AUTOMATED for bots/scripts).
-    # Token count is estimated at ~4 characters per token.
-    _estimated_tokens = max(1, len(request.question) // 4)
+    # Phase 2: the human turn — classified from behaviour
+    tokens = max(1, len(req.question) // 4)
     telemetry.get_client().capture(TelemetryEvent(
         event_type="user_message",
-        user_id=user_data.get("user_id"),
-        email=user_data.get("email"),
-        display_name=user_data.get("display_name"),
-        department=user_data.get("department"),
-        job_title=user_data.get("job_title"),
-        sailpoint_risk=user_data.get("sailpoint_risk"),
-        data_sources=user_data.get("data_sources"),
-        prompt_tokens=_estimated_tokens,
-        total_tokens=_estimated_tokens,
+        user_id=req.user_id,
+        input_messages=[{"role": "user", "content": req.question}],
+        prompt_tokens=tokens, total_tokens=tokens,
     ))
 
-    # ── Phase 3: arm force_entity_type for the agent pipeline ─────────────
-    # All subsequent llm_call and tool_call events (generated by LangChain)
-    # are internal agent-pipeline events → force them to AGENT.
-    # Synthetic test scripts pass force_entity_type=null to skip this.
-    if request.force_entity_type:
-        user_data["force_entity_type"] = request.force_entity_type
-        current_user_context.set(user_data)
+    # Phase 3: label the agent pipeline (skipped when the caller sends null)
+    if req.force_entity_type:
+        ctx["force_entity_type"] = req.force_entity_type
 
-    # ── Phase 4: run the agent ─────────────────────────────────────────────
-    response = await your_agent.run(request.question)
-    return response
+    # Phase 4: run the agent
+    return await your_agent.run(req.question)
 ```
 
-**What you see in the dashboard per user turn:**
+`start_request()` returns the context dict it set, so adding a key to it (Phase 3) is
+seen by every later event of the request.
 
 | Event type | Entity | Explanation |
 |---|---|---|
-| `user_message` | `HUMAN` | The user's question — classified by behavioural signals |
-| `llm_call` | `AGENT` | LangChain internal LLM call — forced |
-| `tool_call` | `AGENT` | Tool call — inherits AGENT from session state |
-
----
+| `user_message` | from behaviour | The user's turn |
+| `llm_call` | `AGENT` when forced, else from behaviour | The agent's model calls |
+| `tool_call` | forced value, else the session's label | Tool calls |
 
 ### 4. Wire up the LangChain callback handler
 
-Create the handler **after** `telemetry.init()` and pass it per-invocation via `config=`. If you also use `@trace_tool` decorators on your tool functions, disable the handler's tool hooks to avoid double-counting:
+Create it **after** `telemetry.init()` and pass it per invocation. When tools already use
+`@trace_tool`, turn off the handler's tool capture so each call is recorded once:
 
 ```python
 from ai_telemetry.integrations.langchain_integration import create_langchain_handler
 
-_lc_handler = create_langchain_handler(telemetry.get_client())
+handler = create_langchain_handler(telemetry.get_client(),
+                                   capture_tools=False, agent_name="my-agent")
 
-# Disable if tool calls are already captured by @trace_tool decorators
-_lc_handler.on_tool_start = lambda *a, **kw: None
-_lc_handler.on_tool_end   = lambda *a, **kw: None
-_lc_handler.on_tool_error = lambda *a, **kw: None
-
-# Pass per invocation so LCEL propagates it through the full chain
-result = await agent_executor.ainvoke(
-    {"input": user_message},
-    config={"callbacks": [_lc_handler]},
-)
+result = await agent_executor.ainvoke({"input": user_message},
+                                      config={"callbacks": [handler]})
 ```
 
-> **Do not** create the handler before `telemetry.init()` — the client does not exist yet.
+With LangChain `@tool`, put `@trace_tool` underneath it:
 
----
+```python
+@tool
+@trace_tool(t, tool_name="search_records", source_uri=_source)
+def search_records(resource: str, query: str) -> list:
+    """Search a resource."""
+```
 
 ### 5. Write synthetic test scripts correctly
 
-Any script that sends programmatic requests for testing or load generation must pass `force_entity_type=null` so its traffic is classified naturally (HUMAN or AUTOMATED) and does not pollute the AGENT bucket:
+Test scripts send `force_entity_type: null` so their traffic is classified from behaviour:
 
 ```python
-import requests
-
-def send_question(base_url: str, question: str, user_id: str) -> dict:
-    payload = {
-        "question":          question,
-        "user_id":           user_id,
-        "force_entity_type": None,   # ← lets the behavioural classifier run
-    }
-    r = requests.post(f"{base_url}/chat", json=payload, timeout=120)
-    r.raise_for_status()
-    return r.json()
+payload = {"question": question, "user_id": user_id, "force_entity_type": None}
+r = requests.post(f"{base_url}/chat", json=payload, timeout=120)
 ```
 
-The behavioural classifier will then fire timing and structure rules:
-- Fast, templated, imperative prompts → `AUTOMATED`
-- Conversational prompts with human-like pacing → `HUMAN`
-
----
-
 ### 6. Graceful shutdown
-
-Always call `shutdown()` when the process exits so in-flight events are flushed before the background thread is killed:
 
 ```python
 @asynccontextmanager
@@ -414,109 +398,145 @@ async def lifespan(app: FastAPI):
 
 ---
 
-## 4. Extending the SDK (For Open Source Contributors)
+## 3d. Connecting your chatbot to a Zendata Autonomous Workflow scan
 
-We welcome contributions to expand the ecosystem! Here is how you can contribute:
+A Zendata **Autonomous Workflow** scan can score *your own* chatbot. Zendata sends it test
+traffic; your SDK ships the resulting telemetry to Zendata; the scan collects it.
 
-### Adding a New Auto-Patcher (e.g., OpenAI GPT-4o, Cohere)
-If you want to add auto-instrumentation for a new LLM provider library:
-1. Create a new file: `user-monitor-sdk/ai_telemetry/integrations/yourprovider_integration.py`.
-2. Implement a `patch_yourprovider(client: TelemetryClient)` function.
-3. Monkey-patch the library's base generation method to wrap it in timing logic and construct a `TelemetryEvent`.
-4. Add the flag to `ai_telemetry/__init__.py`'s `init()` parameters (e.g., `auto_patch_yourprovider=False`).
+**1. Point the SDK at Zendata.** Copy the *Ingest endpoint* and *Project key* from step 4 of
+the Autonomous Workflow wizard (the key is per user and can only send telemetry):
 
-### Custom Log Exporters
-Currently, `_send()` in `client.py` writes to a local CSV (`logs/events.csv`) and does an HTTP POST.
-* **To contribute:** You could abstract `_send` into an `Exporter` interface, allowing developers to configure `KafkaExporter`, `S3Exporter`, or `DatadogExporter`.
+```python
+import os
+import ai_telemetry as telemetry
+
+os.environ.setdefault("ZENDATA_ENGINE_URL", "mock")   # built-in risk evaluator — without it
+                                                       # pii_detected / composite risk stay empty
+telemetry.init(
+    app_id="claims-bot",                               # the app_id your code declares
+    api_key=os.environ["ZENDATA_API_KEY"],             # the project key (zdi_…)
+    endpoint="https://dashboard.zendata.dev/api/telemetry/ingest",
+)
+```
+
+The SDK flushes every 5 s or every 20 events (`{"events": [...]}` with `X-API-Key`). Send
+your chatbot one message, wait ~10 s, then press **Run Connectivity Test** in the wizard.
+
+> If the wizard shows "Unavailable (NetworkError …)" for the endpoint and key, a browser
+> content blocker is blocking URLs containing `telemetry`. Allow the dashboard's domain.
+
+**2. Accept Zendata's test calls.** During the scan Zendata (from IP **3.84.255.108**) calls:
+
+| Call | Request | Your reply |
+|---|---|---|
+| Health check | `GET {url}/` | any status below 500 |
+| Each question | `POST {url}/chat` · `{"question": "...", "user_id": "<roster id>", "force_entity_type": null}` · optional auth header you configure | JSON `{"answer": "..."}` within 120 s |
+
+Up to 10 calls run in parallel; *calls per identity* (1–10) × the roster, capped at 500.
+
+**3. Attribute every call to its user.** Use the request's `user_id` in `start_request()`
+(Step 2) before any LLM call. The IDs come from the scan's identity roster, so events join
+to identities. Keep the §3c pattern: capture the `user_message` event first, then honour
+`force_entity_type` (Zendata sends `null`, so the behavioural classifier runs).
+
+`ai_telemetry.export.write_events_csv()` is what the scan uses to turn the received events
+back into `events.csv` with exactly the columns this SDK writes locally.
+
+---
+
+## 3e. Identity Roster and Scope
+
+`init(identity_roster="identities.csv")` builds one capability manifest per identity from
+an identity/entitlement export (SailPoint, Entra ID, Okta, …). Column names are matched
+flexibly (`identity_manifest.py`):
+
+| Field | Accepted columns |
+|---|---|
+| id | `id`, `identity_id`, `principal_id`, `user_id`, `sub` |
+| entitlements | `entitlements`, `permissions`, `grants`, `scopes` (`resource.action`, separated by `\|` or `,`) |
+| type | `identity_type`, `type`, `principal_type` (`human` / `machine`) |
+| clearance | `permitted_classifications`, `clearance`, `data_classifications` |
+| certified prompt | `system_prompt_hash`, `certified_prompt_hash` |
+| others | `displayName`, `email`, `department`, `roles`, `agent_type`, `description`, `approved_by` |
+
+An entitlement with no action counts as read. A source is in scope when an entitlement's
+resource equals it or is a prefix of it followed by `/` or `:` (`payroll_db` covers
+`payroll_db/employees`, not `payroll_db_archive`). A trailing `/*` and glob patterns are
+also supported (`manifest.py::_covers`). Name your `source_uri`s with the roster's
+resource names.
+
+---
+
+## 3f. Persisting Learned State
+
+Several detectors learn over many calls (drift baselines activate after 100 calls). A
+process that restarts, such as a daily batch job, starts from zero unless it carries the
+state:
+
+```python
+from ai_telemetry import persistence
+
+persistence.load_state("/data/sdk_state.json")   # before the first event
+...
+persistence.save_state("/data/sdk_state.json")   # at shutdown (atomic write)
+```
+
+The file is JSON (never pickle), so loading it cannot execute code.
+
+---
+
+## 4. Extending the SDK (For Contributors)
+
+### Adding a New Auto-Patcher
+1. Create `ai_telemetry/integrations/yourprovider_integration.py`.
+2. Implement `patch_yourprovider(client)` that wraps the library's generation method,
+   times it and captures a `TelemetryEvent`.
+3. Add an `auto_patch_yourprovider=False` flag to `init()` in `ai_telemetry/__init__.py`.
+
+### Custom Exporters
+`TelemetryClient._send()` runs the flush-thread enrichment, then `_send_http()` (primary)
+and, when `enable_local_log=True`, `_write_csv()` and `_write_jsonl()`. A new destination
+(Kafka, S3, Datadog) belongs next to `_send_http()`.
 
 ### Modifying the Security Engine Integration
-The Zendata integration in `zendata_integration.py` uses standard `urllib` to avoid heavy dependencies (like `requests` or `aiohttp`).
-* Note that `evaluate_event` currently runs synchronously during `capture()`.
-* **Future Enhancement:** If latency becomes a concern for large payloads, consider contributing an asynchronous evaluation pipeline using `asyncio` or a separate worker thread specifically for Zendata classification.
+`evaluate_event` in `integrations/zendata_integration.py` uses only `urllib`. It runs on the
+background flush thread for `llm_call` events, never on the caller's thread.
+`ZENDATA_ENGINE_URL=mock` uses the built-in evaluator.
 
 ---
 
 ## 5. Local Testing
 
-To test telemetry modifications locally without needing a real server:
-
-1. Set `ZENDATA_ENGINE_URL=mock` in your environment.
-2. Set `debug=True` in `telemetry.init()`.
-3. Run a quick python script:
+Test without a server by writing events to a local file:
 
 ```python
+import os
 import ai_telemetry as telemetry
 from ai_telemetry.client import TelemetryEvent
 
-client = telemetry.init("test", "test", debug=True)
+os.environ["ZENDATA_ENGINE_URL"] = "mock"
 
-# Directly capture a mock event
+client = telemetry.init("test", "test", endpoint="http://127.0.0.1:9/disabled",
+                        enable_local_log=True, log_path="./events.csv", debug=True)
 client.capture(TelemetryEvent(
     event_type="llm_call",
-    input_messages=[{"role": "user", "content": "My SSN is 000-00-0000"}]
+    input_messages=[{"role": "user", "content": "My SSN is 078-05-1120"}],
 ))
-
-client.shutdown() # Forces flush
-```
-Check `logs/events.csv` to ensure the mock Zendata engine caught the SSN and flagged it as `pii_detected=True`.
-
-## Step 1: Setup Environment and Dependencies
-
-Assuming you're at the root of the project (`/home/t8000/Downloads/CODE_Other_Models/Zendata/Financial_SDK/financial_rag_project`):
-```bash
-# Activate your existing virtual environment
-source venv/bin/activate
-
-# Install the standard requirements
-pip install -r requirements.txt
-
-# Install your local telemetry SDK in editable mode
-pip install -e ./user-monitor-sdk
+client.shutdown()      # flushes
 ```
 
-## Step 2: Configure Environment Variables
+`./events.csv` (and `./events.jsonl`) will show `pii_detected=True`, `pii_types=SSN`. The
+HTTP send to the disabled endpoint fails silently; local logs are written regardless.
 
-Ensure you have a `.env` file (you can copy `.env-example` if you haven't already) containing at least your Google Cloud credentials, Zendata configuration, and Telemetry settings:
-```env
-# Example essential config
-GOOGLE_PROJECT_ID="your-gcp-project-id"
-GOOGLE_LOCATION="us-central1"
-TELEMETRY_ENABLED=true
-TELEMETRY_STORAGE_PATH=./logs/events.csv
-```
-
-## Step 3: Run Data Pipelines (Optional if already fetched)
-
-If you haven't fetched the data and trained the predictive model yet, run these sequentially:
-```bash
-python3 companies.py
-python3 fetch_data.py
-python3 app/models/train_predictor.py
-```
-
-## Step 4: Start the Server
-
-Launch the FastAPI backend that serves the agents and the UI:
-```bash
-uvicorn app.main:app --reload --port 8080
-```
+Unit tests: `python -m pytest tests/` (Python) and `npm test` (TypeScript).
 
 ---
 
-## 3. Where is the Output Saved & Shown?
+## 6. Where Output Goes
 
-Once the system is running and you start interacting with it, outputs and logs are distributed in three main places:
-
-### 1. User Interface (Frontend)
-- **Where to find it:** Open your browser and go to `http://127.0.0.1:8080`.
-- **What it shows:** You will see the web UI chat interface to interact with your Root/Sub-Agents.
-
-### 2. Real-Time Telemetry Logs
-- **Where to find it:** The `logs/events.csv` file.
-- **What it shows:** Every time an agent processes a request or uses a tool, a tab-delimited record is appended here synchronously. It includes the execution metrics (latency, tokens used), the user's identity context, and security classifications (like PII types and Zendata composite risk scores).
-
-### 3. Backend Console Logs
-- **Where to find it:** Your terminal window running `uvicorn` (or outputted to `uvicorn.log` in the root).
-- **What it shows:** Standard FastAPI routing logs, application errors, and general telemetry debug data.
-
-> **Note:** You also have an offline batch processing script (`calculate_usage.py`) which, when run, will output aggregate analytics to your `logs_example/` directory (such as `identity_summary.csv` or `zendata_summary.json`).
+| Output | When | Location |
+|---|---|---|
+| Ingest (HTTP) | always | `endpoint`, batches of `{"events": [...]}` with `X-API-Key` |
+| Local CSV | `enable_local_log=True` | `log_path`, default `$ZENDATA_LOG_DIR/events.csv` (temp dir if unset) |
+| Local JSONL | `enable_local_log=True` | same path with `.jsonl` |
+| Diagnostics | `debug=True` | stdout, prefixed `[AI Telemetry]` |

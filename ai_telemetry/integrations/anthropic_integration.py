@@ -53,6 +53,7 @@ def patch_anthropic(telemetry: "TelemetryClient"):
         raise ImportError("anthropic package is not installed. Run: pip install anthropic")
 
     from ai_telemetry.client import TelemetryEvent
+    from ai_telemetry.transport import protocol_of_client
 
     _original_create = anthropic.resources.messages.Messages.create
 
@@ -85,6 +86,7 @@ def patch_anthropic(telemetry: "TelemetryClient"):
             )
 
             _capture_system_prompt_fields(event, kwargs, telemetry)
+            event.call_protocol = protocol_of_client(self_anthropic)
 
             if response is not None:
                 # Extract text and tool_use blocks
@@ -144,6 +146,7 @@ def patch_anthropic(telemetry: "TelemetryClient"):
             )
 
             _capture_system_prompt_fields(event, kwargs, telemetry)
+            event.call_protocol = protocol_of_client(self_anthropic)
 
             if response is not None:
                 text_blocks = [b for b in response.content if b.type == "text"]

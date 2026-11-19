@@ -1,0 +1,20 @@
+# Pre-commit hooks — secret detection.
+#
+# ZD-W0-04 · diligence. Deliberately minimal: this repo has never had a
+# formatter run over it, so adding black/isort/flake8 here would fail every
+# subsequent commit until a formatting sweep lands. That sweep is ZD-W4-04,
+# kept separate so its churn never pollutes a reviewable diff. Until then,
+# these two hooks stop the one thing that must never reach a branch.
+#
+# Install once per clone:  pre-commit install
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: detect-private-key
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.28.0
+    hooks:
+      - id: gitleaks

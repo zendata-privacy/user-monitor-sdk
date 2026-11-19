@@ -82,6 +82,10 @@ class TelemetryEvent:
     tool_input: Optional[Dict] = None
     tool_output: Optional[Any] = None
 
+    # Call type: transport protocol of the endpoint the call went to
+    # (https | http | grpc | grpcs | wss | ws | unix …). Empty when unknown.
+    call_protocol: Optional[str] = None
+
     # Error fields
     error_type: Optional[str] = None
     error_message: Optional[str] = None
@@ -145,6 +149,7 @@ class TelemetryEvent:
     entity_subtype: Optional[str] = None           # SUBAGENT_RECEIVER | ORCHESTRATOR_SENDER
     classification_signals: Optional[str] = None   # pipe-delimited rule IDs that fired
     behavioral_alerts: Optional[str] = None        # pipe-delimited alert names
+    session_id: Optional[str] = None               # the conversation this turn belongs to
     session_turn_index: Optional[int] = None       # 0-based turn number within the session
     inter_turn_latency_ms: Optional[int] = None    # ms between last response and this submission
     prompt_submission_time_ms: Optional[int] = None  # epoch ms when the prompt was submitted
@@ -158,6 +163,33 @@ class TelemetryEvent:
     repo: Optional[str] = None
     commit_sha: Optional[str] = None       # may carry a "-dirty" suffix
     build_id: Optional[str] = None
+
+    # Module 9 — Source provenance and scope boundary.
+    #
+    # SOURCE provenance, not BUILD provenance. The three fields above say which
+    # commit this code came from; these say which document this answer came
+    # from. Different questions, deliberately adjacent so the distinction is
+    # visible to anyone reading the schema.
+    source_uri: Optional[str] = None            # where the retrieved data came from
+    source_type: Optional[str] = None           # s3_bucket | database | vector_index | ...
+    source_classification: Optional[str] = None # PII | PHI | CREDENTIALS | INTERNAL | PUBLIC
+    source_in_manifest: Optional[bool] = None   # was it within declared scope
+    content_hash: Optional[str] = None          # SHA-256 at retrieval, for drift detection
+    manipulation_delta: Optional[bool] = None   # content changed since last retrieval
+    origin_agent: Optional[str] = None          # agent that retrieved it, when it arrived via handoff
+    manifest_version: Optional[int] = None      # which manifest this was evaluated against
+    asset_arn: Optional[str] = None             # the scanned asset this agent is; joins runtime back to the scan
+
+    scope_signals: Optional[str] = None         # pipe-delimited SC_* signal names
+    scope_severity: Optional[str] = None        # CRITICAL | HIGH | MEDIUM
+    scope_srm_weight: Optional[float] = None    # heaviest single weight, for SRM input
+    scope_violation_count: Optional[int] = None
+
+    # The full provenance chain. A list of objects, so it rides the JSONL and
+    # HTTP paths only — CSV cannot represent it, and flattening it to a
+    # delimited string would lose the per-tag classification that the collusion
+    # check depends on. The CSV carries source_uri for the single-source case.
+    source_provenance: Optional[List[Dict]] = None
 
     # Custom metadata
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -189,6 +221,13 @@ class TelemetryClient:
         embed_fn: Optional[Callable[[str], List[float]]] = None,
         pii_redactor: Optional[Any] = None,
         classify_pii: bool = True,
+        manifest: Optional[Any] = None,
+        pii_api_key: Optional[str] = None,
+        pii_api_endpoint: Optional[str] = None,
+        max_hash_bytes: Optional[int] = None,
+        baseline_store: Optional[Any] = None,
+        manifest_store: Optional[Any] = None,
+        pii_concurrency: int = 4,
     ):
         self.app_id = app_id
         self.api_key = api_key
@@ -206,6 +245,34 @@ class TelemetryClient:
         self.classify_pii = classify_pii
         # Pre-compute the API-key hash once so every event gets it for free
         self._api_key_hash: Optional[str] = _sha256(api_key) if api_key else None
+
+        # ── Module 9 — scope boundary ─────────────────────────────────────
+        # The manifest is the hard boundary: declared scope, available from the
+        # first call, and unable to be taught to accept drift the way an
+        # observed baseline can. None means no boundary is declared and every
+        # SC_* source signal stays silent — an agent nobody scoped is reported
+        # as unscoped, never as compliant.
+        self.manifest = manifest
+        # Per-identity manifests, for a process serving many principals. When
+        # set it is consulted before self.manifest — see scope_runtime.
+        self.manifest_store = manifest_store
+        self.max_hash_bytes = max_hash_bytes
+        # Content classification via the Zendata PII API. Runs only on the
+        # background flush thread; see ai_telemetry/classification.py.
+        self.pii_classifier = None
+        if pii_api_key:
+            from ai_telemetry.classification import PiiApiClassifier
+            self.pii_classifier = PiiApiClassifier(
+                api_key=pii_api_key, endpoint=pii_api_endpoint, debug=debug)
+        # PII API calls are network round trips (~0.5 s each). Made one at a
+        # time they cap labelling at ~2 events/s, far below what a busy host
+        # produces, so the flush thread falls behind and the queue overflows.
+        self.pii_concurrency = max(1, int(pii_concurrency))
+        # The soft boundary. Absent until a baseline store is supplied, and
+        # every soft-boundary signal stays suppressed while it is — a baseline
+        # is loaded from an offline build, never accumulated in process, so an
+        # SDK with no store simply has no observed scope to compare against.
+        self.baseline_store = baseline_store
         self.log_path = log_path or os.path.join(
             os.environ.get("ZENDATA_LOG_DIR", os.path.join(tempfile.gettempdir(), "zendata")),
             "events.csv",
@@ -225,14 +292,35 @@ class TelemetryClient:
     # Public API
     # ------------------------------------------------------------------
 
+    @property
+    def manifest_version(self) -> Optional[int]:
+        """Version of the capability manifest in force, or None if unscoped.
+
+        Every violation record carries this. Without it a finding cannot be
+        reproduced later, because nobody can reconstruct which boundary was in
+        force when it fired.
+        """
+        return self.manifest.manifest_version if self.manifest is not None else None
+
     def capture(self, event: TelemetryEvent):
         """Enqueue a telemetry event (non-blocking)."""
         event.app_id = self.app_id
 
         # --- Module 1: always-on signal fields --------------------------------
-        # api_key_hash: attach unless the caller has already set it
+        # api_key_hash identifies the CALLER's credential (the field's own
+        # definition), and agent_id is derived from it. When the host knows
+        # which credential made this request — a service account's key on a
+        # machine endpoint — it puts it in the context and that is what is
+        # hashed. Falling back to the SDK's own ingest key, the previous and
+        # only behaviour, made every machine caller of a shared application the
+        # same agent, so per-agent baselines and drift could not exist.
         if not event.api_key_hash:
-            event.api_key_hash = self._api_key_hash
+            from ai_telemetry.context import current_user_context as _cuc
+            _ctx = _cuc.get() or {}
+            caller_key = _ctx.get("caller_api_key")
+            event.api_key_hash = (_ctx.get("caller_api_key_hash")
+                                  or (_sha256(str(caller_key)) if caller_key else None)
+                                  or self._api_key_hash)
 
         # build provenance: same contract as api_key_hash — attach unless the
         # caller set it. current_provenance() is lru_cached, so this is a tuple
@@ -264,6 +352,16 @@ class TelemetryClient:
         # and let the host app override via user_ctx["session_id"] when it has
         # a more meaningful conversation id.
         session_id = user_ctx.get("session_id") or entity_key
+        # Stamp it on the event. It was computed here for the entity classifier
+        # and thrown away, so shipped telemetry carried no session identifier at
+        # all — and the behavioural baseline is defined in SESSIONS. Grouping by
+        # trace_id instead is not a substitute: a trace is one interaction, so a
+        # hundred turns of a single conversation would read as a hundred
+        # sessions and trip MIN_SESSIONS_FOR_BASELINE roughly a hundred times
+        # early, on precisely the thin data the spec warns produces excessive
+        # false positives.
+        if not event.session_id:
+            event.session_id = session_id
 
         # --- Module 1: ip_hash and http_headers_digest from request context ----
         # The host application sets "ip_address" and/or "http_headers" in
@@ -278,6 +376,15 @@ class TelemetryClient:
             headers = user_ctx.get("http_headers")
             if isinstance(headers, dict) and headers:
                 event.http_headers_digest = _digest_http_headers(headers)
+
+        # Trust boundary from DECLARED egress (context.record_egress), stamped
+        # here on the caller's thread because the evaluator that scores it runs
+        # on the flush thread, where the request context no longer exists.
+        # Hosts that declare nothing leave it unset and keep the evaluator's
+        # heuristic.
+        if event.trust_boundary_crossed is None and user_ctx.get("_request_acc") is not None:
+            from ai_telemetry.context import request_boundary_crossed
+            event.trust_boundary_crossed = request_boundary_crossed()
 
         forced_entity = user_ctx.get("force_entity_type")
 
@@ -351,14 +458,22 @@ class TelemetryClient:
                 print("[AI Telemetry] Queue full — dropping event")
 
     def flush(self):
-        """Flush all pending events synchronously."""
-        events = []
-        while not self._queue.empty():
-            try:
-                events.append(self._queue.get_nowait())
-            except queue.Empty:
-                break
-        if events:
+        """Flush all pending events synchronously, ``batch_size`` at a time.
+
+        Draining the whole queue into one ``_send`` made a busy host wait for
+        every queued event to be enriched before ANY of them was delivered, and
+        produced single POSTs of up to max_queue_size events. Sending each batch
+        as soon as it is enriched keeps delivery flowing and the queue short.
+        """
+        while True:
+            events = []
+            while len(events) < self.batch_size:
+                try:
+                    events.append(self._queue.get_nowait())
+                except queue.Empty:
+                    break
+            if not events:
+                return
             self._send(events)
 
     def shutdown(self):
@@ -381,9 +496,27 @@ class TelemetryClient:
         from ai_telemetry.integrations.zendata_integration import evaluate_event
         from ai_telemetry.agent_fingerprint import fingerprint_agent, get_fingerprint_store
         from ai_telemetry.drift_detector import analyze_drift, derive_zasp_score
+        # Content labelling by the Zendata PII service, when configured.
+        # Background thread only (see PiiApiClassifier). Labels are MERGED
+        # into pii_types, never replacing the inline regex labels. The calls for
+        # one batch run concurrently; each touches only its own event.
+        if self.pii_classifier is not None:
+            self._label_batch_with_pii_service(events)
         for event in events:
+
+            # Module 9 — source provenance and scope boundary. Runs for every
+            # event type, not just llm_call: the retrieval that crosses a
+            # boundary is a tool_call, and by the time the llm_call happens the
+            # data is already in the context window.
+            try:
+                from ai_telemetry.scope_runtime import evaluate_scope
+                evaluate_scope(self, event)
+            except Exception as ex:
+                if self.debug:
+                    print(f"[AI Telemetry] Scope evaluation error (non-fatal): {ex}")
+
             if event.event_type == "llm_call":
-                evaluate_event(event)
+                evaluate_event(event, permitted_classifications=self._clearance_for(event))
                 # Module 3 — build/update agent fingerprint for non-human callers
                 if event.entity_type in ("API CALL", "AGENT", "AMBIGUOUS"):
                     try:
@@ -445,6 +578,66 @@ class TelemetryClient:
             except Exception as ex:
                 if self.debug:
                     print(f"[AI Telemetry] JSONL write failed (non-fatal): {ex}")
+
+    def _clearance_for(self, event: TelemetryEvent):
+        """The data classes this event's caller is cleared for, or None when no
+        manifest declares any (an undeclared clearance is "nobody said", which
+        the evaluator must not read as "cleared for nothing")."""
+        try:
+            from ai_telemetry.scope_runtime import _manifest_for
+            manifest = _manifest_for(self, event, event.agent_id or self.app_id)
+        except Exception:
+            return None
+        if manifest is None or not manifest.declares_classifications():
+            return None
+        return set(manifest.permitted_classifications)
+
+    @staticmethod
+    def _pii_text(event: TelemetryEvent) -> str:
+        """The content of this event worth labelling: what the caller typed,
+        what tools returned, and what the model answered. The system prompt is
+        excluded — it is the application's own text, identical on every call."""
+        parts: List[str] = []
+        for msg in event.input_messages or ():
+            if isinstance(msg, dict) and msg.get("role") != "system" and msg.get("content"):
+                parts.append(str(msg["content"]))
+        if event.output_message and event.output_message.get("content"):
+            parts.append(str(event.output_message["content"]))
+        if event.tool_output is not None:
+            parts.append(event.tool_output if isinstance(event.tool_output, str) else str(event.tool_output))
+        return "\n".join(parts)
+
+    def _label_batch_with_pii_service(self, events: List[TelemetryEvent]) -> None:
+        def one(event: TelemetryEvent) -> None:
+            try:
+                self._label_with_pii_service(event)
+            except Exception as ex:
+                if self.debug:
+                    print(f"[AI Telemetry] PII service labelling error (non-fatal): {ex}")
+
+        workers = min(self.pii_concurrency, len(events))
+        if workers <= 1:
+            for event in events:
+                one(event)
+            return
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ai-telemetry-pii") as pool:
+            list(pool.map(one, events))
+
+    def _label_with_pii_service(self, event: TelemetryEvent) -> None:
+        if event.event_type not in ("llm_call", "tool_call", "user_message"):
+            return
+        text = self._pii_text(event)
+        if not text:
+            return
+        found = self.pii_classifier.entity_types(text, _sha256(text))
+        if not found:
+            if event.pii_detected is None:
+                event.pii_detected = False
+            return
+        existing = {t for t in (event.pii_types or "").split("|") if t}
+        event.pii_types = "|".join(sorted(existing | found))
+        event.pii_detected = True
 
     def _send_http(self, events: List[TelemetryEvent]):
         _MAX_RETRIES = 3
@@ -539,7 +732,7 @@ class TelemetryClient:
             "pii_detected", "pii_types", "trust_boundary_crossed", "risk_signal",
             "zendata_composite_risk", "zendata_classification", "data_sources", "tools_called",
             "entity_type", "entity_subtype", "classification_signals", "behavioral_alerts",
-            "session_turn_index", "inter_turn_latency_ms",
+            "session_id", "session_turn_index", "inter_turn_latency_ms",
             # Module 1 — Signal Capture additions
             "api_key_hash", "system_prompt_hash", "ip_hash", "http_headers_digest",
             # Module 2 — Human vs. Non-Human Classification
@@ -558,6 +751,21 @@ class TelemetryClient:
             # an older header. Growing only at the tail is the one change that
             # leaves existing columns where they were.
             "repo", "commit_sha", "build_id",
+            # Module 9 — source provenance and scope boundary. Appended at the
+            # tail for the same reason build provenance was: every consumer is
+            # positional once the header is parsed.
+            #
+            # source_provenance (the full tag chain) is deliberately absent. It
+            # is a list of objects; flattening it to a delimited string would
+            # drop the per-tag classification and retrieved_by that the
+            # collusion check depends on, and a column that silently loses the
+            # field it is named after is worse than no column. It rides the
+            # JSONL and HTTP paths, which can carry structure.
+            "source_uri", "source_type", "source_classification",
+            "source_in_manifest", "content_hash", "manipulation_delta",
+            "origin_agent", "manifest_version", "asset_arn",
+            "scope_signals", "scope_severity", "scope_srm_weight",
+            "scope_violation_count",
         ]
 
         log_file = self.log_path
@@ -638,6 +846,7 @@ class TelemetryClient:
                     "entity_subtype": e.entity_subtype or "",
                     "classification_signals": e.classification_signals or "",
                     "behavioral_alerts": e.behavioral_alerts or "",
+                    "session_id": e.session_id or "",
                     "session_turn_index": e.session_turn_index if e.session_turn_index is not None else "",
                     "inter_turn_latency_ms": e.inter_turn_latency_ms if e.inter_turn_latency_ms is not None else "",
                     # Module 1 additions
@@ -670,6 +879,20 @@ class TelemetryClient:
                     "repo": e.repo or "",
                     "commit_sha": e.commit_sha or "",
                     "build_id": e.build_id or "",
+                    # Module 9 — source provenance and scope boundary
+                    "source_uri": e.source_uri or "",
+                    "source_type": e.source_type or "",
+                    "source_classification": e.source_classification or "",
+                    "source_in_manifest": e.source_in_manifest if e.source_in_manifest is not None else "",
+                    "content_hash": e.content_hash or "",
+                    "manipulation_delta": e.manipulation_delta if e.manipulation_delta is not None else "",
+                    "origin_agent": e.origin_agent or "",
+                    "manifest_version": e.manifest_version if e.manifest_version is not None else "",
+                    "asset_arn": e.asset_arn or "",
+                    "scope_signals": e.scope_signals or "",
+                    "scope_severity": e.scope_severity or "",
+                    "scope_srm_weight": e.scope_srm_weight if e.scope_srm_weight is not None else "",
+                    "scope_violation_count": e.scope_violation_count if e.scope_violation_count is not None else "",
                     # system_prompt_embedding is omitted from CSV (float[] — stored in JSONL only)
                 }
                 meta = e.metadata or {}

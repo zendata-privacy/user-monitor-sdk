@@ -30,10 +30,19 @@ def _safe_serialize(obj, max_depth: int = 2):
     return str(obj)
 
 
+def _request_or_ctx(user_ctx, acc_field: str, ctx_field: str):
+    """Accumulated value for this request when an accumulator exists, else the context's."""
+    from ai_telemetry.context import request_sources, request_tools
+    if user_ctx.get("_request_acc") is not None:
+        return request_tools() if acc_field == "tools" else request_sources()
+    return user_ctx.get(ctx_field)
+
+
 def trace_llm(
     telemetry: "TelemetryClient",
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    call_protocol: Optional[str] = None,
 ):
     """
     Decorator: wraps any function that calls an LLM and captures telemetry.
@@ -50,6 +59,7 @@ def trace_llm(
             event_type="llm_call" if not error_info else "error",
             model=model or "unknown",
             provider=provider or "generic",
+            call_protocol=call_protocol,
             latency_ms=latency_ms,
             metadata={"function": fn.__name__},
             user_id=user_ctx.get("user_id"),
@@ -58,8 +68,8 @@ def trace_llm(
             department=user_ctx.get("department"),
             job_title=user_ctx.get("job_title"),
             sailpoint_risk=user_ctx.get("sailpoint_risk"),
-            data_sources=user_ctx.get("data_sources"),
-            tools_called=user_ctx.get("tools_called"),
+            data_sources=_request_or_ctx(user_ctx, "sources", "data_sources"),
+            tools_called=_request_or_ctx(user_ctx, "tools", "tools_called"),
             **error_info,
         )
         if result is not None:
@@ -111,32 +121,94 @@ def trace_llm(
     return decorator
 
 
-def trace_tool(telemetry: "TelemetryClient", tool_name: Optional[str] = None):
+def trace_tool(
+    telemetry: "TelemetryClient",
+    tool_name: Optional[str] = None,
+    source_uri: Optional[str] = None,
+    classification: Optional[str] = None,
+    call_protocol: Optional[str] = None,
+):
     """
     Decorator: wraps any tool/function call and captures telemetry.
 
     @trace_tool(client, tool_name="web_search")
     def web_search(query: str) -> str:
         ...
+
+    ``source_uri`` declares where this tool reads from, which is what the scope
+    boundary check needs and what the SDK cannot work out for itself — all it
+    sees here is a function name, its arguments and its return value::
+
+        @trace_tool(client, tool_name="lookup_account",
+                    source_uri="arn:aws:dynamodb:us-east-1:...:table/CustomerAccounts")
+        def lookup_account(customer_id: str) -> dict:
+            ...
+
+    Use it for tools that always read the same place. For sources only known at
+    runtime use ``source_context()``; for boto3 calls, the interceptor reports
+    the real ARN with no annotation at all.
+
+    ``classification`` optionally pins what this tool returns (PII, PHI,
+    CREDENTIALS, INTERNAL, PUBLIC) when the operator knows better than content
+    inspection does — a table of pseudonymous ids that content scanning would
+    read as clean, for instance.
+
+    ``call_protocol`` declares how the tool reaches its source (https, http,
+    grpc, …). When omitted it is taken from the scheme of ``source_uri``
+    (``https://…`` → https, ``postgres://…`` → postgres); an ARN or a plain
+    function leaves it empty.
     """
+    from ai_telemetry.transport import protocol_from_url
+    from ai_telemetry.context import record_sources, record_tool, request_sources, request_tools
+    tool_protocol = call_protocol or (None if callable(source_uri) else protocol_from_url(source_uri))
+
+    def _resolve_sources(args, kwargs, result):
+        """The source(s) this call actually read.
+
+        ``source_uri`` may be a callable ``(args, kwargs, result) -> str | list``
+        for tools whose source is only known at call time — a generic record
+        lookup whose table is an argument. A static string is returned as-is.
+        """
+        if not source_uri:
+            return []
+        if callable(source_uri):
+            try:
+                found = source_uri(args, kwargs, result)
+            except Exception:
+                return []
+            if not found:
+                return []
+            return [found] if isinstance(found, str) else [s for s in found if s]
+        return [source_uri]
+
     def _capture_tool_event(name, start, args, kwargs, result, error_info):
         from ai_telemetry.client import TelemetryEvent
         latency_ms = int((time.time() - start) * 1000)
         user_ctx = current_user_context.get()
+        sources = _resolve_sources(args, kwargs, result)
 
-        # Append tool to current context so that llm_call can see what tools were called
+        # Make the tool and its sources visible to every later event of this
+        # request. With a request accumulator (context.start_request) that works
+        # across threads and copied contexts; without one, fall back to setting
+        # the context, which only reaches events in this same context.
         updated_ctx = {**user_ctx}
-        tools_called = updated_ctx.get("tools_called", "")
-        if tools_called:
-            if name not in tools_called.split("|"):
-                updated_ctx["tools_called"] = tools_called + "|" + name
+        if user_ctx.get("_request_acc") is not None:
+            record_tool(name)
+            record_sources(sources)
+            updated_ctx["tools_called"] = request_tools()
         else:
-            updated_ctx["tools_called"] = name
-        current_user_context.set(updated_ctx)
+            tools_called = updated_ctx.get("tools_called", "")
+            if tools_called:
+                if name not in tools_called.split("|"):
+                    updated_ctx["tools_called"] = tools_called + "|" + name
+            else:
+                updated_ctx["tools_called"] = name
+            current_user_context.set(updated_ctx)
 
         event = TelemetryEvent(
             event_type="tool_call" if not error_info else "error",
             tool_name=name,
+            call_protocol=tool_protocol,
             tool_input=_safe_serialize({"args": args, "kwargs": kwargs}),
             tool_output=_safe_serialize(result),
             latency_ms=latency_ms,
@@ -153,9 +225,21 @@ def trace_tool(telemetry: "TelemetryClient", tool_name: Optional[str] = None):
             # BEFORE any tool, so it saw an empty list too. Net effect: the
             # column existed and was never populated by anything.
             tools_called=updated_ctx.get("tools_called"),
-            data_sources=updated_ctx.get("data_sources"),
+            # What THIS call read when it declares it; otherwise whatever the
+            # host put in the context (the pre-existing behaviour).
+            data_sources="|".join(sources) if sources else updated_ctx.get("data_sources"),
+            session_id=updated_ctx.get("session_id"),
             **error_info,
         )
+        # Declared source identity — producer 1 of the four described in
+        # ai_telemetry/scope_runtime.py. Set on the event rather than resolved
+        # here: hashing and classifying the content is background-thread work,
+        # and this decorator runs on the caller's. Several sources ride
+        # data_sources (producer 3), which scope_runtime splits into one tag each.
+        if len(sources) == 1:
+            event.source_uri = sources[0]
+        if classification:
+            event.source_classification = classification
         telemetry.capture(event)
 
     def decorator(fn):

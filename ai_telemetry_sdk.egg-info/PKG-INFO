@@ -2,7 +2,7 @@ Metadata-Version: 2.4
 Name: ai-telemetry-sdk
 Version: 1.0.0
 Summary: AI application telemetry — capture prompts, completions, tool calls, tokens, and errors.
-License: MIT
+License-Expression: MIT
 Keywords: ai,telemetry,observability,llm,openai,anthropic,langchain
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
@@ -12,13 +12,10 @@ Provides-Extra: anthropic
 Requires-Dist: anthropic>=0.20; extra == "anthropic"
 Provides-Extra: langchain
 Requires-Dist: langchain-core>=0.1; extra == "langchain"
-Provides-Extra: aws
-Requires-Dist: boto3>=1.28; extra == "aws"
 Provides-Extra: all
 Requires-Dist: openai>=1.0; extra == "all"
 Requires-Dist: anthropic>=0.20; extra == "all"
 Requires-Dist: langchain-core>=0.1; extra == "all"
-Requires-Dist: boto3>=1.28; extra == "all"
 Provides-Extra: dev
 Requires-Dist: pytest; extra == "dev"
 Requires-Dist: pytest-asyncio; extra == "dev"
@@ -52,12 +49,22 @@ Your App → [AI Telemetry SDK] → (batched HTTPS) → Your Ingest Endpoint →
 ### Install
 
 ```bash
-pip install ai-telemetry-sdk                    # core only
+pip install ai-telemetry-sdk                    # core only — zero hard dependencies
 pip install "ai-telemetry-sdk[openai]"          # + OpenAI
 pip install "ai-telemetry-sdk[anthropic]"       # + Anthropic
 pip install "ai-telemetry-sdk[langchain]"       # + LangChain
 pip install "ai-telemetry-sdk[all]"             # everything
 ```
+
+The SDK itself is **cloud-agnostic** — there is no AWS or Azure SDK in
+its dependency graph. PII masking is delegated to a user-supplied
+redactor (the project root provides a Zendata `pii-api` integration);
+log shipping is handled by the project-level `upload_blob_bucket.py`, which
+selects between Amazon S3 and Azure Blob Storage at runtime via a
+`CLOUD_PROVIDER` env var. See `../guide_to_deploy.md` §8 and §10b for
+the multi-cloud deployment recipe (Azure Container Instances and
+Azure Container Apps, with the AWS-hosted `pii-api` reached over
+HTTPS).
 
 ### Quickstart — OpenAI auto-patch
 
@@ -411,6 +418,7 @@ async def chat_endpoint(request: ChatRequest):
 | `session_turn_index` | `int` | 0-based turn number within the session |
 | `inter_turn_latency_ms` | `int` | ms between the previous response and this submission |
 | `prompt_submission_time_ms` | `int` | Epoch ms when the prompt was received by the application |
+| `call_protocol` | `str` | Call type: transport protocol of the endpoint the call went to (`https`, `http`, `grpc`, `wss`, …), from the client's base URL; for tools, from `call_protocol=` or the scheme of `source_uri`. Empty when unknown; only the scheme is recorded |
 
 ### Classification signals reference
 

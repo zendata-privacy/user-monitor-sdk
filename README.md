@@ -24,13 +24,21 @@ Your App → [AI Telemetry SDK] → (batched HTTPS) → Your Ingest Endpoint →
 
 ### Install
 
+The SDK is not published on PyPI. Install it from this repository's folder
+(or the copy Zendata provides):
+
 ```bash
-pip install ai-telemetry-sdk                    # core only — zero hard dependencies
-pip install "ai-telemetry-sdk[openai]"          # + OpenAI
-pip install "ai-telemetry-sdk[anthropic]"       # + Anthropic
-pip install "ai-telemetry-sdk[langchain]"       # + LangChain
-pip install "ai-telemetry-sdk[all]"             # everything
+pip install /path/to/user-monitor-sdk                 # core only — zero hard dependencies
+pip install "/path/to/user-monitor-sdk[openai]"       # + OpenAI
+pip install "/path/to/user-monitor-sdk[anthropic]"    # + Anthropic
+pip install "/path/to/user-monitor-sdk[langchain]"    # + LangChain
+pip install "/path/to/user-monitor-sdk[all]"          # everything
 ```
+
+**Integrating a client application?** Follow
+[`docs/CLIENT_INTEGRATION.md`](docs/CLIENT_INTEGRATION.md): install, `init()`,
+identity roster, `start_request()`, `@trace_tool` with `source_uri`,
+`record_egress()`, LangChain and connecting to a Zendata scan.
 
 The SDK itself is **cloud-agnostic** — there is no AWS or Azure SDK in
 its dependency graph. PII masking is delegated to a user-supplied
@@ -394,6 +402,7 @@ async def chat_endpoint(request: ChatRequest):
 | `session_turn_index` | `int` | 0-based turn number within the session |
 | `inter_turn_latency_ms` | `int` | ms between the previous response and this submission |
 | `prompt_submission_time_ms` | `int` | Epoch ms when the prompt was received by the application |
+| `call_protocol` | `str` | Call type: transport protocol of the endpoint the call went to (`https`, `http`, `grpc`, `wss`, …), from the client's base URL; for tools, from `call_protocol=` or the scheme of `source_uri`. Empty when unknown; only the scheme is recorded |
 
 ### Classification signals reference
 
