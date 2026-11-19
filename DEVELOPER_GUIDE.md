@@ -413,7 +413,7 @@ import ai_telemetry as telemetry
 os.environ.setdefault("ZENDATA_ENGINE_URL", "mock")   # built-in risk evaluator — without it
                                                        # pii_detected / composite risk stay empty
 telemetry.init(
-    app_id="claims-bot",                               # the app_id your code declares
+    app_id="claims-bot",                               # = step 4 "Application identity"
     api_key=os.environ["ZENDATA_API_KEY"],             # the project key (zdi_…)
     endpoint="https://dashboard.zendata.dev/api/telemetry/ingest",
 )
@@ -424,6 +424,14 @@ your chatbot one message, wait ~10 s, then press **Run Connectivity Test** in th
 
 > If the wizard shows "Unavailable (NetworkError …)" for the endpoint and key, a browser
 > content blocker is blocking URLs containing `telemetry`. Allow the dashboard's domain.
+
+**Before relying on it, read how the key and endpoint behave**
+([`docs/CLIENT_INTEGRATION.md` §9](docs/CLIENT_INTEGRATION.md#how-the-key-and-endpoint-behave)):
+the key is per user, not per project, and a scan collects everything received under it in
+its window; `app_id` must match the scan's Application identity or code findings stay
+LATENT; only batches received before the scan's 20 s post-traffic wait are collected; a
+POST is limited to 1,000 events / 5 MB (larger batches are refused and not retried); a
+single key cannot be rotated on its own.
 
 **2. Accept Zendata's test calls.** During the scan Zendata (from IP **3.84.255.108**) calls:
 
