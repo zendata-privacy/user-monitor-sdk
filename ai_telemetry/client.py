@@ -291,6 +291,11 @@ class TelemetryClient:
 
         self._queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
         self._shutdown = threading.Event()
+        # One flush at a time. shutdown() flushes on the caller's thread while
+        # the background thread, woken by the same event, flushes too; without
+        # this both appended to events.csv through separate buffered handles,
+        # which can interleave rows, and both POSTed concurrently.
+        self._flush_lock = threading.Lock()
         self._thread = threading.Thread(target=self._flush_loop, daemon=True)
         self._thread.start()
         atexit.register(self.shutdown)
@@ -475,17 +480,19 @@ class TelemetryClient:
         every queued event to be enriched before ANY of them was delivered, and
         produced single POSTs of up to max_queue_size events. Sending each batch
         as soon as it is enriched keeps delivery flowing and the queue short.
+        Serialised: a second caller waits, then finds the queue already drained.
         """
-        while True:
-            events = []
-            while len(events) < self.batch_size:
-                try:
-                    events.append(self._queue.get_nowait())
-                except queue.Empty:
-                    break
-            if not events:
-                return
-            self._send(events)
+        with self._flush_lock:
+            while True:
+                events = []
+                while len(events) < self.batch_size:
+                    try:
+                        events.append(self._queue.get_nowait())
+                    except queue.Empty:
+                        break
+                if not events:
+                    return
+                self._send(events)
 
     def shutdown(self):
         """Flush remaining events and stop the background thread."""

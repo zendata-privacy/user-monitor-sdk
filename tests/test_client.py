@@ -317,3 +317,46 @@ class TestPiiLabelLlmInput:
         c.capture(ev)
         assert ev.pii_detected is True and "SSN" in (ev.pii_types or "")
         c.shutdown()
+
+
+class TestFlushSerialised:
+    """Two flushes never send at the same time (shutdown() vs the flush thread)."""
+
+    def test_concurrent_flushes_do_not_overlap(self, server_url):
+        import threading
+        c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url,
+                            batch_size=5, flush_interval_s=999)
+        state = {"active": 0, "peak": 0, "sent": 0}
+        lock = threading.Lock()
+
+        def slow_send(events):
+            with lock:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+            time.sleep(0.05)
+            with lock:
+                state["active"] -= 1
+                state["sent"] += len(events)
+
+        with patch.object(c, "_send", side_effect=slow_send):
+            for _ in range(40):
+                c.capture(TelemetryEvent(event_type="tool_call"))
+            threads = [threading.Thread(target=c.flush) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        assert state["peak"] == 1
+        assert state["sent"] == 40          # every event sent exactly once
+        assert c._queue.qsize() == 0
+        c.shutdown()
+
+    def test_shutdown_flushes_everything_once(self, server_url):
+        c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url,
+                            batch_size=7, flush_interval_s=0.01)
+        sent = []
+        with patch.object(c, "_send_http", side_effect=lambda evs: sent.extend(e.event_id for e in evs)):
+            for _ in range(50):
+                c.capture(TelemetryEvent(event_type="tool_call"))
+            c.shutdown()
+        assert len(sent) == 50 and len(set(sent)) == 50
