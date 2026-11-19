@@ -266,3 +266,54 @@ def test_pii_concurrency_defaults_to_one(server_url):
     c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url, flush_interval_s=999)
     assert c.pii_concurrency == 1
     c.shutdown()
+
+
+class TestPiiLabelLlmInput:
+    """pii_label_llm_input=False sends only an llm_call's answer to the PII API."""
+
+    def _llm_event(self):
+        return TelemetryEvent(
+            event_type="llm_call",
+            input_messages=[{"role": "system", "content": "You are a bank assistant."},
+                            {"role": "user", "content": "my ssn is 078-05-1120"}],
+            output_message={"role": "assistant", "content": "Your balance is $10."})
+
+    def _sent(self, server_url, **kw):
+        c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url, flush_interval_s=999, **kw)
+        texts = []
+
+        class _Rec:
+            def entity_types(self, text, content_hash):
+                texts.append(text)
+                return set()
+        c.pii_classifier = _Rec()
+        return c, texts
+
+    def test_default_sends_input_and_answer(self, server_url):
+        c, texts = self._sent(server_url)
+        c._label_with_pii_service(self._llm_event())
+        assert texts == ["my ssn is 078-05-1120\nYour balance is $10."]
+        c.shutdown()
+
+    def test_false_sends_only_the_answer(self, server_url):
+        c, texts = self._sent(server_url, pii_label_llm_input=False)
+        c._label_with_pii_service(self._llm_event())
+        assert texts == ["Your balance is $10."]
+        c.shutdown()
+
+    def test_false_keeps_other_event_types_whole(self, server_url):
+        c, texts = self._sent(server_url, pii_label_llm_input=False)
+        c._label_with_pii_service(TelemetryEvent(
+            event_type="user_message", input_messages=[{"role": "user", "content": "hello"}]))
+        c._label_with_pii_service(TelemetryEvent(event_type="tool_call", tool_output="row 1"))
+        assert texts == ["hello", "row 1"]
+        c.shutdown()
+
+    def test_inline_classifier_still_sees_the_input(self, server_url):
+        # The regex classifier runs at capture() on every field, so an SSN in an
+        # llm_call's input is still labelled with the PII API skipping it.
+        c, _ = self._sent(server_url, pii_label_llm_input=False)
+        ev = self._llm_event()
+        c.capture(ev)
+        assert ev.pii_detected is True and "SSN" in (ev.pii_types or "")
+        c.shutdown()
