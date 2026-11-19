@@ -291,6 +291,13 @@ class TelemetryClient:
 
         self._queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
         self._shutdown = threading.Event()
+        # Events refused because the queue was full. Counted and reported
+        # (once when it starts, and in total at shutdown) whether or not debug
+        # is on: a silent drop made a scan look complete with 70% of its
+        # telemetry missing.
+        self.max_queue_size = max_queue_size
+        self.dropped_events = 0
+        self._dropped_lock = threading.Lock()
         # One flush at a time. shutdown() flushes on the caller's thread while
         # the background thread, woken by the same event, flushes too; without
         # this both appended to events.csv through separate buffered handles,
@@ -470,7 +477,14 @@ class TelemetryClient:
         try:
             self._queue.put_nowait(event)
         except queue.Full:
-            if self.debug:
+            with self._dropped_lock:
+                self.dropped_events += 1
+                first = self.dropped_events == 1
+            if first:
+                print(f"[AI Telemetry] Queue full (max_queue_size={self.max_queue_size}) — "
+                      "dropping events. Raise max_queue_size, or the flush is too slow "
+                      "for this load.")
+            elif self.debug:
                 print("[AI Telemetry] Queue full — dropping event")
 
     def flush(self):
@@ -499,6 +513,9 @@ class TelemetryClient:
         self._shutdown.set()
         self.flush()
         self._thread.join(timeout=5)
+        if self.dropped_events:
+            print(f"[AI Telemetry] {self.dropped_events} event(s) were dropped because the "
+                  f"queue was full (max_queue_size={self.max_queue_size}).")
 
     # ------------------------------------------------------------------
     # Internal
