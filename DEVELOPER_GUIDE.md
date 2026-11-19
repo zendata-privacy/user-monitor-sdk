@@ -114,6 +114,7 @@ Main parameters (all are documented in the `init()` docstring):
 | `identity_roster` | `None` | Identity/entitlement CSV: one manifest per identity |
 | `system_prompt`, `permitted_sources`, `permitted_tools`, `permitted_classifications`, `prohibited_sources` | `None` | Declare a single agent's scope directly (no roster) |
 | `pii_api_key`, `pii_api_endpoint` | `None` | Zendata PII API labelling on the flush thread |
+| `max_queue_size` | `1000` | Events held for the background flush. When full, new events are dropped (counted and reported at shutdown) |
 | `pii_label_llm_input` | `True` | `False` sends only the model's answer of an `llm_call` to the PII API, when user messages and tool results are captured as their own events |
 | `pii_concurrency` | `1` | PII API calls made at once per flush batch. The PII service serves one request per task, so keep this at or below its task count |
 | `pii_redactor` | `None` | Your own redactor (masks and labels); otherwise the built-in classifier labels only (`classify_pii=True`) |

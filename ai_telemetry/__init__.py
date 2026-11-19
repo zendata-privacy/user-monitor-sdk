@@ -56,6 +56,7 @@ def init(
     identity_roster: Optional[str] = None,
     pii_concurrency: int = 1,
     pii_label_llm_input: bool = True,
+    max_queue_size: int = 1000,
 ) -> TelemetryClient:
     """
     Initialize the AI Telemetry SDK.
@@ -141,6 +142,10 @@ def init(
                              tool results are captured as their own events
                              (start_request + @trace_tool): they are labelled
                              there, and only the model's answer is new.
+        max_queue_size:      Events held for the background flush (default
+                             1000). When it is full new events are DROPPED
+                             (counted, and reported at shutdown). Size it for
+                             the burst you expect while labelling catches up.
 
     Returns:
         TelemetryClient instance (also set as the module-level default).
@@ -215,6 +220,7 @@ def init(
         manifest_store=manifest_store,
         pii_concurrency=pii_concurrency,
         pii_label_llm_input=pii_label_llm_input,
+        max_queue_size=max_queue_size,
     )
     _default_client = client
 

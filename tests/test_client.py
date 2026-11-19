@@ -360,3 +360,34 @@ class TestFlushSerialised:
                 c.capture(TelemetryEvent(event_type="tool_call"))
             c.shutdown()
         assert len(sent) == 50 and len(set(sent)) == 50
+
+
+class TestDroppedEvents:
+    """A full queue is counted and reported, never silent."""
+
+    def test_drops_are_counted_and_reported(self, server_url, capsys):
+        c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url,
+                            max_queue_size=3, flush_interval_s=999)
+        for _ in range(10):
+            c.capture(TelemetryEvent(event_type="tool_call"))
+        assert c.dropped_events == 7
+        out = capsys.readouterr().out
+        assert out.count("Queue full (max_queue_size=3)") == 1      # warned once, not per event
+        with patch.object(c, "_send_http"):
+            c.shutdown()
+        assert "7 event(s) were dropped" in capsys.readouterr().out
+
+    def test_no_report_when_nothing_dropped(self, server_url, capsys):
+        c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url, flush_interval_s=999)
+        c.capture(TelemetryEvent(event_type="tool_call"))
+        with patch.object(c, "_send_http"):
+            c.shutdown()
+        assert c.dropped_events == 0 and "dropped" not in capsys.readouterr().out
+
+    def test_init_passes_max_queue_size(self):
+        import ai_telemetry
+        c = ai_telemetry.init(app_id="app", api_key="key", endpoint="http://127.0.0.1:9/x",
+                              max_queue_size=50_000)
+        assert c.max_queue_size == 50_000 and c._queue.maxsize == 50_000
+        with patch.object(c, "_send_http"):
+            c.shutdown()
