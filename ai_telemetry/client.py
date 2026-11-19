@@ -303,6 +303,15 @@ class TelemetryClient:
         # this both appended to events.csv through separate buffered handles,
         # which can interleave rows, and both POSTed concurrently.
         self._flush_lock = threading.Lock()
+        # Delivery counters reported by stats(). Plain ints under one lock:
+        # updated once per captured event and once per POST, so cheap.
+        self._stats_lock = threading.Lock()
+        self._captured = 0
+        self._sent_events = 0
+        self._sent_batches = 0
+        self._send_failures = 0
+        self._last_send_ms: Optional[int] = None
+        self._last_capture_ms: Optional[int] = None
         self._thread = threading.Thread(target=self._flush_loop, daemon=True)
         self._thread.start()
         atexit.register(self.shutdown)
@@ -476,6 +485,9 @@ class TelemetryClient:
             event.tool_output = None
         try:
             self._queue.put_nowait(event)
+            with self._stats_lock:
+                self._captured += 1
+                self._last_capture_ms = int(time.time() * 1000)
         except queue.Full:
             with self._dropped_lock:
                 self.dropped_events += 1
@@ -486,6 +498,42 @@ class TelemetryClient:
                       "for this load.")
             elif self.debug:
                 print("[AI Telemetry] Queue full — dropping event")
+
+    def stats(self) -> Dict[str, Any]:
+        """Delivery counters since this client was created (thread-safe, cheap).
+
+        captured/dropped: events accepted into / refused by the queue.
+        sent_events/sent_batches: events and POSTs the endpoint accepted (2xx).
+        send_failures: batches that were not delivered (4xx, retries
+        exhausted, or skipped while the circuit breaker was open).
+        pii_calls/pii_failures: PII API requests made (cache misses only).
+        last_send_ms/last_capture_ms: epoch ms, None until it first happens.
+        """
+        with self._stats_lock:
+            out: Dict[str, Any] = {
+                "captured": self._captured,
+                "sent_events": self._sent_events,
+                "sent_batches": self._sent_batches,
+                "send_failures": self._send_failures,
+                "last_send_ms": self._last_send_ms,
+                "last_capture_ms": self._last_capture_ms,
+            }
+        with self._dropped_lock:
+            out["dropped"] = self.dropped_events
+        out["queued"] = self._queue.qsize()
+        out["queue_max"] = self.max_queue_size
+        out["pii_calls"] = int(getattr(self.pii_classifier, "calls", 0) or 0)
+        out["pii_failures"] = int(getattr(self.pii_classifier, "failures", 0) or 0)
+        return out
+
+    def _count_send(self, ok: bool, n_events: int = 0) -> None:
+        with self._stats_lock:
+            if ok:
+                self._sent_events += n_events
+                self._sent_batches += 1
+                self._last_send_ms = int(time.time() * 1000)
+            else:
+                self._send_failures += 1
 
     def flush(self):
         """Flush all pending events synchronously, ``batch_size`` at a time.
@@ -686,6 +734,7 @@ class TelemetryClient:
         if self._circuit_open_until > time.time():
             if self.debug:
                 print("[AI Telemetry] Circuit open — skipping send")
+            self._count_send(False)
             return
 
         serializable = []
@@ -717,6 +766,7 @@ class TelemetryClient:
                     if self.debug:
                         print(f"[AI Telemetry] Flushed {len(events)} events → {resp.status}")
                     self._consecutive_failures = 0
+                    self._count_send(True, len(serializable))
                     return  # success
             except urllib.error.HTTPError as e:
                 if e.code < 500:
@@ -724,6 +774,7 @@ class TelemetryClient:
                     self._consecutive_failures = 0
                     if self.debug:
                         print(f"[AI Telemetry] Send failed (client error {e.code}): {e}")
+                    self._count_send(False)
                     return
                 last_err = e  # 5xx — fall through to retry
             except urllib.error.URLError as e:
@@ -736,6 +787,7 @@ class TelemetryClient:
                 time.sleep(wait)
 
         # All retries exhausted
+        self._count_send(False)
         self._consecutive_failures += 1
         if self._consecutive_failures >= _CIRCUIT_THRESHOLD:
             self._circuit_open_until = time.time() + _CIRCUIT_COOLDOWN_S

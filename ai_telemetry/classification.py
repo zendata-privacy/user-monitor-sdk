@@ -299,6 +299,10 @@ class PiiApiClassifier:
         self._cache_order: List[str] = []
         self._cache_size = cache_size
         self._lock = threading.Lock()
+        # Requests actually sent (cache misses) and how many of them failed;
+        # read by TelemetryClient.stats().
+        self.calls = 0
+        self.failures = 0
 
     # ------------------------------------------------------------------
 
@@ -326,9 +330,13 @@ class PiiApiClassifier:
         if hit is not None:
             return set(hit)
 
+        with self._lock:
+            self.calls += 1
         try:
             types = self._call(text[: self.max_chars])
         except Exception as exc:                       # noqa: BLE001 — see docstring
+            with self._lock:
+                self.failures += 1
             if self.debug:
                 print(f"[AI Telemetry] PII API classification skipped: {exc}")
             return set()

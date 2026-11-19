@@ -207,6 +207,16 @@ telemetry.get_client().shutdown()     # flushes the queue
 
 For short-lived processes, carry learned state between runs (see §3f).
 
+### Delivery counters (`stats()`)
+
+`telemetry.get_client().stats()` returns cheap, thread-safe counters since the
+client was created — useful for a host's own `/stats` or health endpoint:
+`captured`, `dropped` (queue full), `queued`, `queue_max`, `sent_events` and
+`sent_batches` (2xx POSTs), `send_failures` (batches not delivered: 4xx,
+retries exhausted, or circuit breaker open), `pii_calls` / `pii_failures`
+(PII API requests, cache misses only), and `last_send_ms` / `last_capture_ms`
+(epoch ms, `None` until first seen).
+
 ---
 
 ## 3b. Entity Classification (Human vs. Agent Detection)

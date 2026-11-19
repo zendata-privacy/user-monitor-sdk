@@ -391,3 +391,66 @@ class TestDroppedEvents:
         assert c.max_queue_size == 50_000 and c._queue.maxsize == 50_000
         with patch.object(c, "_send_http"):
             c.shutdown()
+
+
+class TestStats:
+    """stats(): delivery counters for a live status page."""
+
+    def test_initial_stats(self, client):
+        s = client.stats()
+        assert s == {"captured": 0, "dropped": 0, "queued": 0, "queue_max": client.max_queue_size,
+                     "sent_events": 0, "sent_batches": 0, "send_failures": 0,
+                     "pii_calls": 0, "pii_failures": 0,
+                     "last_send_ms": None, "last_capture_ms": None}
+
+    def test_counts_capture_and_successful_send(self, client, mock_server):
+        for _ in range(3):
+            client.capture(TelemetryEvent(event_type="tool_call"))
+        s = client.stats()
+        assert s["captured"] == 3 and s["queued"] == 3 and s["last_capture_ms"]
+        client.flush()
+        s = client.stats()
+        assert s["queued"] == 0 and s["sent_events"] == 3 and s["sent_batches"] == 1
+        assert s["send_failures"] == 0 and s["last_send_ms"] >= s["last_capture_ms"]
+        assert len(mock_server.received) == 1
+
+    def test_counts_dropped(self, server_url):
+        c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url,
+                            max_queue_size=2, flush_interval_s=999)
+        for _ in range(5):
+            c.capture(TelemetryEvent(event_type="tool_call"))
+        s = c.stats()
+        assert s["captured"] == 2 and s["dropped"] == 3 and s["queue_max"] == 2
+        with patch.object(c, "_send_http"):
+            c.shutdown()
+
+    def test_counts_send_failures(self, client):
+        err = urllib.error.HTTPError(url="", code=401, msg="Unauthorized", hdrs={}, fp=None)
+        with patch("urllib.request.urlopen", side_effect=err):
+            client.capture(TelemetryEvent(event_type="tool_call"))
+            client.flush()
+        s = client.stats()
+        assert s["send_failures"] == 1 and s["sent_events"] == 0 and s["last_send_ms"] is None
+
+    def test_circuit_open_counts_as_failure(self, client):
+        client._circuit_open_until = time.time() + 60
+        client.capture(TelemetryEvent(event_type="tool_call"))
+        client.flush()
+        assert client.stats()["send_failures"] == 1
+
+    def test_counts_pii_calls_on_cache_miss_only(self):
+        from ai_telemetry.classification import PiiApiClassifier
+        clf = PiiApiClassifier(api_key="k", endpoint="http://127.0.0.1:9/x")
+        with patch.object(clf, "_call", return_value={"SSN"}):
+            clf.entity_types("a", "h1")
+            clf.entity_types("a", "h1")          # cache hit — no call
+        with patch.object(clf, "_call", side_effect=OSError("down")):
+            clf.entity_types("b", "h2")
+        assert clf.calls == 2 and clf.failures == 1
+        c = TelemetryClient(app_id="app", api_key="key", endpoint="http://127.0.0.1:9/x",
+                            flush_interval_s=999)
+        c.pii_classifier = clf
+        s = c.stats()
+        assert s["pii_calls"] == 2 and s["pii_failures"] == 1
+        with patch.object(c, "_send_http"):
+            c.shutdown()
