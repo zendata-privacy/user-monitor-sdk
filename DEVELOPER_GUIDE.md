@@ -77,11 +77,30 @@ The SDK is a **zero-dependency, non-blocking** observation layer for LLM applica
 
 ### Step 0: Install
 
-The SDK is not on PyPI. Install it from this repository's folder:
+The SDK is not on PyPI. Get the source from GitHub (private repository: your
+GitHub account needs access to `zendata-privacy`), then install it from the folder:
 
 ```bash
-pip install /path/to/user-monitor-sdk               # core
-pip install "/path/to/user-monitor-sdk[langchain]"  # + extras: openai, anthropic, langchain, all
+git clone https://github.com/zendata-privacy/user-monitor-sdk.git
+cd user-monitor-sdk                 # default branch `development` = latest version
+pip install .                       # core
+pip install ".[langchain]"          # + extras: openai, anthropic, langchain, all
+```
+
+To pin the SDK inside your application's repository instead (what the virtual
+bank does), add it as a submodule and install from there:
+
+```bash
+git submodule add https://github.com/zendata-privacy/user-monitor-sdk.git sdk
+git submodule update --init         # after cloning your application
+pip install ./sdk
+```
+
+In a Docker image, copy the folder and install it:
+
+```dockerfile
+COPY sdk /opt/sdk
+RUN pip install --no-cache-dir /opt/sdk
 ```
 
 ### Step 1: Initialization
@@ -103,6 +122,17 @@ telemetry.init(
     debug=False,
 )
 ```
+
+The roster and the user id are two different inputs, and the SDK needs both:
+
+| | Where it comes from | Answers |
+|---|---|---|
+| `user_id` | The agent system's code, via `start_request()` on every request | Who is making this call? |
+| `identity_roster="config/identities.csv"` | A file given to `init()` once, at startup (the IAM export) | What is that person allowed to access? |
+
+The SDK joins them on every event: the event's `user_id` selects that identity's entries
+in the roster, and what the call read is checked against them. The roster's `id` column must
+therefore hold the same values your code passes as `user_id` (see "Identify the User").
 
 Main parameters (all are documented in the `init()` docstring):
 
@@ -162,6 +192,61 @@ Optional context keys the SDK reads:
 | `ip_address`, `http_headers` | Hashed into `ip_hash`, `http_headers_digest` |
 | `caller_api_key` / `caller_api_key_hash` | Identifies a machine caller's credential (gives each agent its own `agent_id`) |
 | `force_entity_type` | Forces the label on `llm_call` and `tool_call` events (see §3c) |
+
+### Identify the User
+
+The SDK does not work out who is calling. Your application tells it, once per request,
+through `start_request()`, and the SDK stamps that identity on every event of the request
+(the user message, every LLM call, every tool call).
+
+**Where the id comes from: your own authentication.** Identify the caller the way your
+application already does (SSO session, JWT, API key) and pass the result. The SDK records
+what you assert; it does not authenticate anyone.
+
+```python
+from ai_telemetry.context import start_request
+
+user = authenticate(request)                 # YOUR login: SSO / JWT / session
+start_request(
+    user_id=user.id,                         # MUST be the id used in the identity roster
+    email=user.email, display_name=user.name,
+    department=user.department, job_title=user.title,
+    sailpoint_risk=user.risk_score,          # optional: the IAM risk score, if you have one
+    session_id=request.session_id,
+    prompt_text=question,
+    prompt_submission_time_ms=int(time.time() * 1000),
+)
+```
+
+**Service accounts and agents** also pass the credential they authenticated with. The SDK
+hashes it (`api_key_hash`) and derives the agent's `agent_id` from it, so each service
+account is its own agent with its own drift baseline:
+
+```python
+start_request(user_id="svc_trading_bot", caller_api_key=presented_key, ...)
+```
+
+**What the id is used for**
+
+| Use | How |
+|---|---|
+| Attribution | `user_id`, `email`, `display_name`, `department`, `job_title` on every event |
+| Scope check | the event's `user_id` selects that identity's manifest from the roster (§3e); a read outside its entitlements is `SC_OUT_OF_SCOPE_SOURCE` |
+| Human vs machine | session state and the classifier are tracked per `user_id` (§3b) |
+| Risk | `sailpoint_risk` is the starting point of `zendata_composite_risk` |
+
+**Rules that make identification work**
+
+1. **Same id everywhere.** The `user_id` you pass must be exactly the `id` column of the
+   identity roster you give `init(identity_roster=...)` and upload to the Zendata scan. If
+   your application uses emails and the IAM export uses employee ids, nothing matches:
+   every read looks out of scope and no identity details join.
+2. **Call it before the first LLM or tool call** of the request. Events captured without it
+   are attributed to `"unknown"`.
+3. **Once per request**, not once per process: the context is per request, so concurrent
+   requests from different users never mix.
+4. **Pass the real caller.** In an agent that acts on a user's behalf, the identity is the
+   user's, not the agent's; a service account calling on its own is its own identity.
 
 ### Step 3: Decorating Functions
 
