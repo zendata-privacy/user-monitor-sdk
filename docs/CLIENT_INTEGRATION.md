@@ -131,9 +131,16 @@ def begin_request(identity: dict, text: str, session_id: str, request) -> None:
         ip_address=request.client.host if request.client else None,
     )
     TraceContext.start_trace()                     # one trace per interaction
+    # capture() does not copy the caller from the context (the decorators and the
+    # LangChain handler do), so pass the identity fields on the user's own turn.
     telemetry.get_client().capture(TelemetryEvent(
         event_type="user_message",
         user_id=identity["id"],
+        email=identity.get("email", ""),
+        display_name=identity.get("displayName", ""),
+        department=identity.get("department", ""),
+        job_title=identity.get("jobTitle", ""),
+        sailpoint_risk=identity.get("riskScore", ""),
         session_id=session_id,
         input_messages=[{"role": "user", "content": text}],
     ))
@@ -143,6 +150,10 @@ Use `start_request()` rather than setting `current_user_context` yourself:
 it also creates the per-request record that collects tools, sources and egress
 across threads. Agent frameworks run tools on worker threads, and without it
 the tools used would not appear on the request's events.
+
+If your own code runs a tool on a thread (not LangChain, which handles this), copy the
+context or the tool's events lose the caller:
+`loop.run_in_executor(None, contextvars.copy_context().run, my_tool, arg)`.
 
 Inside your own code, `current_user_context.get()` returns the caller's fields
 (`(current_user_context.get() or {}).get("user_id")`).

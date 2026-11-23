@@ -183,6 +183,17 @@ request carries `tools_called` and the sources read. Setting `current_user_conte
 directly still works, but tools run on other threads (LangChain's executor, for example)
 are then invisible to later events.
 
+**Threads.** The request context is a `contextvars` value. LangChain copies it into the
+threads it runs tools on, so nothing is needed there. If **your own code** runs a tool on a
+thread (`ThreadPoolExecutor`, `loop.run_in_executor`), copy the context explicitly, or the
+tool's events have no user and the request loses its tools and sources:
+
+```python
+import contextvars
+ctx = contextvars.copy_context()
+await loop.run_in_executor(None, ctx.run, my_tool, arg)      # or: pool.submit(ctx.run, my_tool, arg)
+```
+
 Optional context keys the SDK reads:
 
 | Key | Effect |
@@ -250,6 +261,10 @@ start_request(user_id="svc_trading_bot", caller_api_key=presented_key, ...)
 
 ### Step 3: Decorating Functions
 
+Decorate **after** `telemetry.init()`: `@trace_tool(t, ...)` takes the client, so `t` must
+exist when the decorator runs (define the tools after `init()`, or build them in a function
+called after it, as the virtual bank's `build_tools(t)` does).
+
 ```python
 from ai_telemetry.decorators import trace_llm, trace_tool
 import ai_telemetry as telemetry
@@ -291,6 +306,83 @@ telemetry.get_client().shutdown()     # flushes the queue
 ```
 
 For short-lived processes, carry learned state between runs (see §3f).
+
+### Putting it together: one complete, tested example
+
+Everything above in one file: init, two tools, an egress, a LangChain model, one request.
+It runs as is (`pip install langchain-core` plus the SDK; no network — the endpoint is a
+dead address and events also go to a local CSV).
+
+```python
+import asyncio, os, time
+os.environ.setdefault("ZENDATA_ENGINE_URL", "mock")        # built-in risk evaluator
+
+import ai_telemetry as telemetry
+from ai_telemetry.client import TelemetryEvent
+from ai_telemetry.context import TraceContext, start_request, record_egress
+from ai_telemetry.decorators import trace_tool
+from ai_telemetry.integrations.langchain_integration import create_langchain_handler
+from langchain_core.tools import tool
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+# 1. init — once, before any tool is decorated
+telemetry.init(app_id="my-app", api_key="zdi_your_project_key", endpoint="http://127.0.0.1:9/disabled",
+               identity_roster="identities.csv",              # usr_ana: accounts_db.read|reports.read
+               enable_local_log=True, log_path="./events.csv")
+t = telemetry.get_client()
+
+# 2. tools — @tool on top, @trace_tool underneath; source names = roster resource names
+def _source(args, kwargs, result):
+    return f"{kwargs['resource']}/records"
+
+@tool
+@trace_tool(t, tool_name="search_records", source_uri=_source)
+def search_records(resource: str, query: str) -> str:
+    """Search a resource."""
+    return "row: 078-05-1120"
+
+@tool
+@trace_tool(t, tool_name="send_email")
+def send_email(to: str) -> str:
+    """Send an email."""
+    record_egress(f"mailto:{to}", external=not to.endswith("@acme.com"))
+    return "sent"
+
+# 3. agent — model calls through the handler; tools already traced, so capture_tools=False
+llm = FakeListChatModel(responses=["Here is the summary."])     # your real chat model here
+handler = create_langchain_handler(t, capture_tools=False, agent_name="my-agent")
+
+# 4. one request — identity first, then the user's turn, then the agent's work
+async def chat(question: str):
+    ctx = start_request(user_id="usr_ana", email="ana@acme.com", display_name="Ana Lima",
+                        department="Finance", job_title="Analyst", sailpoint_risk="20",
+                        prompt_text=question, prompt_submission_time_ms=int(time.time() * 1000))
+    TraceContext.start_trace()
+    t.capture(TelemetryEvent(event_type="user_message", user_id=ctx["user_id"],
+              email=ctx["email"], display_name=ctx["display_name"], department=ctx["department"],
+              job_title=ctx["job_title"], sailpoint_risk=ctx["sailpoint_risk"],
+              input_messages=[{"role": "user", "content": question}]))
+    await search_records.ainvoke({"resource": "accounts_db", "query": "x"})   # in scope
+    await search_records.ainvoke({"resource": "payroll_db", "query": "x"})    # NOT entitled
+    await send_email.ainvoke({"to": "x@gmail.com"})                           # leaves the org
+    return await llm.ainvoke(question, config={"callbacks": [handler]})
+
+asyncio.run(chat("summarise my accounts"))
+t.shutdown()                                                    # 5. flush
+```
+
+What it writes to `events.csv` (selected columns):
+
+| event_type | user | data_sources | scope_violation_count | trust_boundary_crossed | pii_types |
+|---|---|---|---|---|---|
+| `user_message` | usr_ana, Finance | | | False | |
+| `tool_call` | usr_ana, Finance | `accounts_db/records` | | False | SSN |
+| `tool_call` | usr_ana, Finance | `payroll_db/records` | **1** | False | SSN |
+| `tool_call` (send_email) | usr_ana, Finance | | | **True** | EMAIL |
+| `llm_call` | usr_ana, Finance | both sources | **1** | **True** | |
+
+The model call carries everything the request did (`tools_called`, sources, the scope
+violation, the boundary crossing) — that is what `start_request()` buys you.
 
 ### Delivery counters (`stats()`)
 
@@ -425,11 +517,14 @@ async def chat(req: QueryRequest, request: Request):
     )
     TraceContext.start_trace()
 
-    # Phase 2: the human turn — classified from behaviour
+    # Phase 2: the human turn — classified from behaviour. capture() does NOT copy the
+    # caller from the context (the decorators and the LangChain handler do), so pass it.
     tokens = max(1, len(req.question) // 4)
     telemetry.get_client().capture(TelemetryEvent(
         event_type="user_message",
-        user_id=req.user_id,
+        user_id=ctx["user_id"], email=ctx["email"], display_name=ctx["display_name"],
+        department=ctx["department"], job_title=ctx["job_title"],
+        sailpoint_risk=ctx["sailpoint_risk"],
         input_messages=[{"role": "user", "content": req.question}],
         prompt_tokens=tokens, total_tokens=tokens,
     ))
