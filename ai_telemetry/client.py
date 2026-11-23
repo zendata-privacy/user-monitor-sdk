@@ -227,7 +227,8 @@ class TelemetryClient:
         max_hash_bytes: Optional[int] = None,
         baseline_store: Optional[Any] = None,
         manifest_store: Optional[Any] = None,
-        pii_concurrency: int = 4,
+        pii_concurrency: int = 1,
+        pii_label_llm_input: bool = True,
     ):
         self.app_id = app_id
         self.api_key = api_key
@@ -264,10 +265,20 @@ class TelemetryClient:
             from ai_telemetry.classification import PiiApiClassifier
             self.pii_classifier = PiiApiClassifier(
                 api_key=pii_api_key, endpoint=pii_api_endpoint, debug=debug)
-        # PII API calls are network round trips (~0.5 s each). Made one at a
-        # time they cap labelling at ~2 events/s, far below what a busy host
-        # produces, so the flush thread falls behind and the queue overflows.
+        # PII API calls are network round trips (~0.5 s each), so one at a time
+        # caps labelling at ~2 events/s. The PII service handles ONE request per
+        # task at a time (scale with tasks, not threads): sending more calls at
+        # once than it has tasks only queues them, starves its health checks
+        # and gets tasks replaced. Default 1; raise it to the service's task
+        # count when that has been scaled for the load.
         self.pii_concurrency = max(1, int(pii_concurrency))
+        # An llm_call's input repeats the user's message and the tool results.
+        # When the host captures those as their own user_message / tool_call
+        # events (start_request + @trace_tool), they are labelled there, and
+        # sending them again with every model call more than doubles the PII
+        # API load. False labels only the model's answer on llm_call events.
+        # The inline classifier still labels every field of every event.
+        self.pii_label_llm_input = bool(pii_label_llm_input)
         # The soft boundary. Absent until a baseline store is supplied, and
         # every soft-boundary signal stays suppressed while it is — a baseline
         # is loaded from an offline build, never accumulated in process, so an
@@ -280,6 +291,27 @@ class TelemetryClient:
 
         self._queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
         self._shutdown = threading.Event()
+        # Events refused because the queue was full. Counted and reported
+        # (once when it starts, and in total at shutdown) whether or not debug
+        # is on: a silent drop made a scan look complete with 70% of its
+        # telemetry missing.
+        self.max_queue_size = max_queue_size
+        self.dropped_events = 0
+        self._dropped_lock = threading.Lock()
+        # One flush at a time. shutdown() flushes on the caller's thread while
+        # the background thread, woken by the same event, flushes too; without
+        # this both appended to events.csv through separate buffered handles,
+        # which can interleave rows, and both POSTed concurrently.
+        self._flush_lock = threading.Lock()
+        # Delivery counters reported by stats(). Plain ints under one lock:
+        # updated once per captured event and once per POST, so cheap.
+        self._stats_lock = threading.Lock()
+        self._captured = 0
+        self._sent_events = 0
+        self._sent_batches = 0
+        self._send_failures = 0
+        self._last_send_ms: Optional[int] = None
+        self._last_capture_ms: Optional[int] = None
         self._thread = threading.Thread(target=self._flush_loop, daemon=True)
         self._thread.start()
         atexit.register(self.shutdown)
@@ -453,9 +485,55 @@ class TelemetryClient:
             event.tool_output = None
         try:
             self._queue.put_nowait(event)
+            with self._stats_lock:
+                self._captured += 1
+                self._last_capture_ms = int(time.time() * 1000)
         except queue.Full:
-            if self.debug:
+            with self._dropped_lock:
+                self.dropped_events += 1
+                first = self.dropped_events == 1
+            if first:
+                print(f"[AI Telemetry] Queue full (max_queue_size={self.max_queue_size}) — "
+                      "dropping events. Raise max_queue_size, or the flush is too slow "
+                      "for this load.")
+            elif self.debug:
                 print("[AI Telemetry] Queue full — dropping event")
+
+    def stats(self) -> Dict[str, Any]:
+        """Delivery counters since this client was created (thread-safe, cheap).
+
+        captured/dropped: events accepted into / refused by the queue.
+        sent_events/sent_batches: events and POSTs the endpoint accepted (2xx).
+        send_failures: batches that were not delivered (4xx, retries
+        exhausted, or skipped while the circuit breaker was open).
+        pii_calls/pii_failures: PII API requests made (cache misses only).
+        last_send_ms/last_capture_ms: epoch ms, None until it first happens.
+        """
+        with self._stats_lock:
+            out: Dict[str, Any] = {
+                "captured": self._captured,
+                "sent_events": self._sent_events,
+                "sent_batches": self._sent_batches,
+                "send_failures": self._send_failures,
+                "last_send_ms": self._last_send_ms,
+                "last_capture_ms": self._last_capture_ms,
+            }
+        with self._dropped_lock:
+            out["dropped"] = self.dropped_events
+        out["queued"] = self._queue.qsize()
+        out["queue_max"] = self.max_queue_size
+        out["pii_calls"] = int(getattr(self.pii_classifier, "calls", 0) or 0)
+        out["pii_failures"] = int(getattr(self.pii_classifier, "failures", 0) or 0)
+        return out
+
+    def _count_send(self, ok: bool, n_events: int = 0) -> None:
+        with self._stats_lock:
+            if ok:
+                self._sent_events += n_events
+                self._sent_batches += 1
+                self._last_send_ms = int(time.time() * 1000)
+            else:
+                self._send_failures += 1
 
     def flush(self):
         """Flush all pending events synchronously, ``batch_size`` at a time.
@@ -464,23 +542,28 @@ class TelemetryClient:
         every queued event to be enriched before ANY of them was delivered, and
         produced single POSTs of up to max_queue_size events. Sending each batch
         as soon as it is enriched keeps delivery flowing and the queue short.
+        Serialised: a second caller waits, then finds the queue already drained.
         """
-        while True:
-            events = []
-            while len(events) < self.batch_size:
-                try:
-                    events.append(self._queue.get_nowait())
-                except queue.Empty:
-                    break
-            if not events:
-                return
-            self._send(events)
+        with self._flush_lock:
+            while True:
+                events = []
+                while len(events) < self.batch_size:
+                    try:
+                        events.append(self._queue.get_nowait())
+                    except queue.Empty:
+                        break
+                if not events:
+                    return
+                self._send(events)
 
     def shutdown(self):
         """Flush remaining events and stop the background thread."""
         self._shutdown.set()
         self.flush()
         self._thread.join(timeout=5)
+        if self.dropped_events:
+            print(f"[AI Telemetry] {self.dropped_events} event(s) were dropped because the "
+                  f"queue was full (max_queue_size={self.max_queue_size}).")
 
     # ------------------------------------------------------------------
     # Internal
@@ -593,12 +676,14 @@ class TelemetryClient:
         return set(manifest.permitted_classifications)
 
     @staticmethod
-    def _pii_text(event: TelemetryEvent) -> str:
+    def _pii_text(event: TelemetryEvent, include_llm_input: bool = True) -> str:
         """The content of this event worth labelling: what the caller typed,
         what tools returned, and what the model answered. The system prompt is
-        excluded — it is the application's own text, identical on every call."""
+        excluded — it is the application's own text, identical on every call.
+        With include_llm_input=False an llm_call contributes only its answer."""
         parts: List[str] = []
-        for msg in event.input_messages or ():
+        skip_input = event.event_type == "llm_call" and not include_llm_input
+        for msg in () if skip_input else (event.input_messages or ()):
             if isinstance(msg, dict) and msg.get("role") != "system" and msg.get("content"):
                 parts.append(str(msg["content"]))
         if event.output_message and event.output_message.get("content"):
@@ -627,7 +712,7 @@ class TelemetryClient:
     def _label_with_pii_service(self, event: TelemetryEvent) -> None:
         if event.event_type not in ("llm_call", "tool_call", "user_message"):
             return
-        text = self._pii_text(event)
+        text = self._pii_text(event, self.pii_label_llm_input)
         if not text:
             return
         found = self.pii_classifier.entity_types(text, _sha256(text))
@@ -649,6 +734,7 @@ class TelemetryClient:
         if self._circuit_open_until > time.time():
             if self.debug:
                 print("[AI Telemetry] Circuit open — skipping send")
+            self._count_send(False)
             return
 
         serializable = []
@@ -680,6 +766,7 @@ class TelemetryClient:
                     if self.debug:
                         print(f"[AI Telemetry] Flushed {len(events)} events → {resp.status}")
                     self._consecutive_failures = 0
+                    self._count_send(True, len(serializable))
                     return  # success
             except urllib.error.HTTPError as e:
                 if e.code < 500:
@@ -687,6 +774,7 @@ class TelemetryClient:
                     self._consecutive_failures = 0
                     if self.debug:
                         print(f"[AI Telemetry] Send failed (client error {e.code}): {e}")
+                    self._count_send(False)
                     return
                 last_err = e  # 5xx — fall through to retry
             except urllib.error.URLError as e:
@@ -699,6 +787,7 @@ class TelemetryClient:
                 time.sleep(wait)
 
         # All retries exhausted
+        self._count_send(False)
         self._consecutive_failures += 1
         if self._consecutive_failures >= _CIRCUIT_THRESHOLD:
             self._circuit_open_until = time.time() + _CIRCUIT_COOLDOWN_S

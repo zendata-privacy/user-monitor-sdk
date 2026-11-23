@@ -258,3 +258,199 @@ class TestPiiLabellingConcurrency:
         assert len(calls) == 5
         assert all(e.pii_detected is False for e in events[1:])
         c.shutdown()
+
+
+def test_pii_concurrency_defaults_to_one(server_url):
+    # The PII service serves one request per task; a higher default would
+    # queue calls behind each other and starve its health checks.
+    c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url, flush_interval_s=999)
+    assert c.pii_concurrency == 1
+    c.shutdown()
+
+
+class TestPiiLabelLlmInput:
+    """pii_label_llm_input=False sends only an llm_call's answer to the PII API."""
+
+    def _llm_event(self):
+        return TelemetryEvent(
+            event_type="llm_call",
+            input_messages=[{"role": "system", "content": "You are a bank assistant."},
+                            {"role": "user", "content": "my ssn is 078-05-1120"}],
+            output_message={"role": "assistant", "content": "Your balance is $10."})
+
+    def _sent(self, server_url, **kw):
+        c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url, flush_interval_s=999, **kw)
+        texts = []
+
+        class _Rec:
+            def entity_types(self, text, content_hash):
+                texts.append(text)
+                return set()
+        c.pii_classifier = _Rec()
+        return c, texts
+
+    def test_default_sends_input_and_answer(self, server_url):
+        c, texts = self._sent(server_url)
+        c._label_with_pii_service(self._llm_event())
+        assert texts == ["my ssn is 078-05-1120\nYour balance is $10."]
+        c.shutdown()
+
+    def test_false_sends_only_the_answer(self, server_url):
+        c, texts = self._sent(server_url, pii_label_llm_input=False)
+        c._label_with_pii_service(self._llm_event())
+        assert texts == ["Your balance is $10."]
+        c.shutdown()
+
+    def test_false_keeps_other_event_types_whole(self, server_url):
+        c, texts = self._sent(server_url, pii_label_llm_input=False)
+        c._label_with_pii_service(TelemetryEvent(
+            event_type="user_message", input_messages=[{"role": "user", "content": "hello"}]))
+        c._label_with_pii_service(TelemetryEvent(event_type="tool_call", tool_output="row 1"))
+        assert texts == ["hello", "row 1"]
+        c.shutdown()
+
+    def test_inline_classifier_still_sees_the_input(self, server_url):
+        # The regex classifier runs at capture() on every field, so an SSN in an
+        # llm_call's input is still labelled with the PII API skipping it.
+        c, _ = self._sent(server_url, pii_label_llm_input=False)
+        ev = self._llm_event()
+        c.capture(ev)
+        assert ev.pii_detected is True and "SSN" in (ev.pii_types or "")
+        c.shutdown()
+
+
+class TestFlushSerialised:
+    """Two flushes never send at the same time (shutdown() vs the flush thread)."""
+
+    def test_concurrent_flushes_do_not_overlap(self, server_url):
+        import threading
+        c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url,
+                            batch_size=5, flush_interval_s=999)
+        state = {"active": 0, "peak": 0, "sent": 0}
+        lock = threading.Lock()
+
+        def slow_send(events):
+            with lock:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+            time.sleep(0.05)
+            with lock:
+                state["active"] -= 1
+                state["sent"] += len(events)
+
+        with patch.object(c, "_send", side_effect=slow_send):
+            for _ in range(40):
+                c.capture(TelemetryEvent(event_type="tool_call"))
+            threads = [threading.Thread(target=c.flush) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        assert state["peak"] == 1
+        assert state["sent"] == 40          # every event sent exactly once
+        assert c._queue.qsize() == 0
+        c.shutdown()
+
+    def test_shutdown_flushes_everything_once(self, server_url):
+        c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url,
+                            batch_size=7, flush_interval_s=0.01)
+        sent = []
+        with patch.object(c, "_send_http", side_effect=lambda evs: sent.extend(e.event_id for e in evs)):
+            for _ in range(50):
+                c.capture(TelemetryEvent(event_type="tool_call"))
+            c.shutdown()
+        assert len(sent) == 50 and len(set(sent)) == 50
+
+
+class TestDroppedEvents:
+    """A full queue is counted and reported, never silent."""
+
+    def test_drops_are_counted_and_reported(self, server_url, capsys):
+        c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url,
+                            max_queue_size=3, flush_interval_s=999)
+        for _ in range(10):
+            c.capture(TelemetryEvent(event_type="tool_call"))
+        assert c.dropped_events == 7
+        out = capsys.readouterr().out
+        assert out.count("Queue full (max_queue_size=3)") == 1      # warned once, not per event
+        with patch.object(c, "_send_http"):
+            c.shutdown()
+        assert "7 event(s) were dropped" in capsys.readouterr().out
+
+    def test_no_report_when_nothing_dropped(self, server_url, capsys):
+        c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url, flush_interval_s=999)
+        c.capture(TelemetryEvent(event_type="tool_call"))
+        with patch.object(c, "_send_http"):
+            c.shutdown()
+        assert c.dropped_events == 0 and "dropped" not in capsys.readouterr().out
+
+    def test_init_passes_max_queue_size(self):
+        import ai_telemetry
+        c = ai_telemetry.init(app_id="app", api_key="key", endpoint="http://127.0.0.1:9/x",
+                              max_queue_size=50_000)
+        assert c.max_queue_size == 50_000 and c._queue.maxsize == 50_000
+        with patch.object(c, "_send_http"):
+            c.shutdown()
+
+
+class TestStats:
+    """stats(): delivery counters for a live status page."""
+
+    def test_initial_stats(self, client):
+        s = client.stats()
+        assert s == {"captured": 0, "dropped": 0, "queued": 0, "queue_max": client.max_queue_size,
+                     "sent_events": 0, "sent_batches": 0, "send_failures": 0,
+                     "pii_calls": 0, "pii_failures": 0,
+                     "last_send_ms": None, "last_capture_ms": None}
+
+    def test_counts_capture_and_successful_send(self, client, mock_server):
+        for _ in range(3):
+            client.capture(TelemetryEvent(event_type="tool_call"))
+        s = client.stats()
+        assert s["captured"] == 3 and s["queued"] == 3 and s["last_capture_ms"]
+        client.flush()
+        s = client.stats()
+        assert s["queued"] == 0 and s["sent_events"] == 3 and s["sent_batches"] == 1
+        assert s["send_failures"] == 0 and s["last_send_ms"] >= s["last_capture_ms"]
+        assert len(mock_server.received) == 1
+
+    def test_counts_dropped(self, server_url):
+        c = TelemetryClient(app_id="app", api_key="key", endpoint=server_url,
+                            max_queue_size=2, flush_interval_s=999)
+        for _ in range(5):
+            c.capture(TelemetryEvent(event_type="tool_call"))
+        s = c.stats()
+        assert s["captured"] == 2 and s["dropped"] == 3 and s["queue_max"] == 2
+        with patch.object(c, "_send_http"):
+            c.shutdown()
+
+    def test_counts_send_failures(self, client):
+        err = urllib.error.HTTPError(url="", code=401, msg="Unauthorized", hdrs={}, fp=None)
+        with patch("urllib.request.urlopen", side_effect=err):
+            client.capture(TelemetryEvent(event_type="tool_call"))
+            client.flush()
+        s = client.stats()
+        assert s["send_failures"] == 1 and s["sent_events"] == 0 and s["last_send_ms"] is None
+
+    def test_circuit_open_counts_as_failure(self, client):
+        client._circuit_open_until = time.time() + 60
+        client.capture(TelemetryEvent(event_type="tool_call"))
+        client.flush()
+        assert client.stats()["send_failures"] == 1
+
+    def test_counts_pii_calls_on_cache_miss_only(self):
+        from ai_telemetry.classification import PiiApiClassifier
+        clf = PiiApiClassifier(api_key="k", endpoint="http://127.0.0.1:9/x")
+        with patch.object(clf, "_call", return_value={"SSN"}):
+            clf.entity_types("a", "h1")
+            clf.entity_types("a", "h1")          # cache hit — no call
+        with patch.object(clf, "_call", side_effect=OSError("down")):
+            clf.entity_types("b", "h2")
+        assert clf.calls == 2 and clf.failures == 1
+        c = TelemetryClient(app_id="app", api_key="key", endpoint="http://127.0.0.1:9/x",
+                            flush_interval_s=999)
+        c.pii_classifier = clf
+        s = c.stats()
+        assert s["pii_calls"] == 2 and s["pii_failures"] == 1
+        with patch.object(c, "_send_http"):
+            c.shutdown()

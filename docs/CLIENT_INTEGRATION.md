@@ -43,8 +43,12 @@ client (tools, LangChain handler).
 import os
 import ai_telemetry as telemetry
 
+# Built-in risk evaluator: fills pii_detected, zendata_composite_risk and
+# zendata_classification. Without it those risk columns stay empty.
+os.environ.setdefault("ZENDATA_ENGINE_URL", "mock")
+
 telemetry.init(
-    app_id="claims-assistant",                       # your application's id
+    app_id="claims-assistant",                       # must match the scan's app_id (§9)
     api_key=os.environ["ZENDATA_API_KEY"],           # project key from the scan wizard (zdi_…)
     endpoint="https://dashboard.zendata.dev/api/telemetry/ingest",
     capture_prompts=True,                            # False strips prompt/response text
@@ -127,9 +131,16 @@ def begin_request(identity: dict, text: str, session_id: str, request) -> None:
         ip_address=request.client.host if request.client else None,
     )
     TraceContext.start_trace()                     # one trace per interaction
+    # capture() does not copy the caller from the context (the decorators and the
+    # LangChain handler do), so pass the identity fields on the user's own turn.
     telemetry.get_client().capture(TelemetryEvent(
         event_type="user_message",
         user_id=identity["id"],
+        email=identity.get("email", ""),
+        display_name=identity.get("displayName", ""),
+        department=identity.get("department", ""),
+        job_title=identity.get("jobTitle", ""),
+        sailpoint_risk=identity.get("riskScore", ""),
         session_id=session_id,
         input_messages=[{"role": "user", "content": text}],
     ))
@@ -139,6 +150,10 @@ Use `start_request()` rather than setting `current_user_context` yourself:
 it also creates the per-request record that collects tools, sources and egress
 across threads. Agent frameworks run tools on worker threads, and without it
 the tools used would not appear on the request's events.
+
+If your own code runs a tool on a thread (not LangChain, which handles this), copy the
+context or the tool's events lose the caller:
+`loop.run_in_executor(None, contextvars.copy_context().run, my_tool, arg)`.
 
 Inside your own code, `current_user_context.get()` returns the caller's fields
 (`(current_user_context.get() or {}).get("user_id")`).
@@ -301,12 +316,44 @@ A long-running service does not need this.
 Scan traffic comes from IP **3.84.255.108**; allow it if your endpoint is
 restricted.
 
+### How the key and endpoint behave
+
+- **The key is personal, not per project.** Despite the label "Project key",
+  each Zendata user has one key, and everything sent with it goes to that
+  user's ingest area. A scan collects **every** batch received in its time
+  window under the key, whatever `app_id` the events carry. Use the key in one
+  chatbot at a time, and don't run two scans of different chatbots at once
+  with the same account, or their events mix.
+- **`app_id` must match the scan.** Set `app_id=` to the value chosen under
+  **Application identity** on step 4 (it is read from your source by the
+  discovery scan). With any other value, code findings cannot be CONFIRMED by
+  runtime telemetry; they stay LATENT.
+- **Only telemetry received during the scan counts.** The scan collects batches
+  received after its job starts (or up to the **Collection window** hours
+  before, if set) and stops collecting **20 s** after its last call to your
+  chatbot. Events your SDK sends later are not part of that scan, so keep
+  flushes prompt: the SDK flushes every 5 s, but with `pii_api_key` set each
+  event is labelled before it is sent, which can delay a flush under load.
+- **Batch limits.** The endpoint accepts at most **1,000 events** and **5 MB**
+  per POST. A larger batch is refused (HTTP 413) and the SDK does not retry
+  client errors, so that batch is lost. Keep `capture_prompts=False` or lower
+  traffic bursts if your events are large.
+- **The key can only send.** It cannot read anything. Requests from a user
+  who has been deactivated by their organisation are refused. Keys are derived
+  from a Zendata server secret, so a single key cannot be rotated on its own:
+  if a key leaks, contact Zendata, which rotates the secret (this changes every
+  user's key).
+- If the wizard shows "Unavailable (NetworkError …)" instead of the endpoint
+  and key, a browser content blocker is blocking URLs containing `telemetry`.
+  Allow the dashboard's domain.
+
 ---
 
 ## Checklist
 
 - [ ] SDK installed (`import ai_telemetry` works)
-- [ ] `telemetry.init()` at startup, with the Zendata endpoint and key
+- [ ] `ZENDATA_ENGINE_URL=mock` set, then `telemetry.init()` at startup with the Zendata endpoint and key
+- [ ] `app_id` equals the scan's **Application identity** (step 4)
 - [ ] Identity roster CSV passed as `identity_roster=`
 - [ ] `start_request()` + `user_message` event at the start of every request
 - [ ] Every tool wrapped with `@trace_tool`, with `source_uri` for tools that read data

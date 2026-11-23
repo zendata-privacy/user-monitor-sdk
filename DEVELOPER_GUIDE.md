@@ -77,11 +77,30 @@ The SDK is a **zero-dependency, non-blocking** observation layer for LLM applica
 
 ### Step 0: Install
 
-The SDK is not on PyPI. Install it from this repository's folder:
+The SDK is not on PyPI. Get the source from GitHub (private repository: your
+GitHub account needs access to `zendata-privacy`), then install it from the folder:
 
 ```bash
-pip install /path/to/user-monitor-sdk               # core
-pip install "/path/to/user-monitor-sdk[langchain]"  # + extras: openai, anthropic, langchain, all
+git clone https://github.com/zendata-privacy/user-monitor-sdk.git
+cd user-monitor-sdk                 # default branch `development` = latest version
+pip install .                       # core
+pip install ".[langchain]"          # + extras: openai, anthropic, langchain, all
+```
+
+To pin the SDK inside your application's repository instead (what the virtual
+bank does), add it as a submodule and install from there:
+
+```bash
+git submodule add https://github.com/zendata-privacy/user-monitor-sdk.git sdk
+git submodule update --init         # after cloning your application
+pip install ./sdk
+```
+
+In a Docker image, copy the folder and install it:
+
+```dockerfile
+COPY sdk /opt/sdk
+RUN pip install --no-cache-dir /opt/sdk
 ```
 
 ### Step 1: Initialization
@@ -104,6 +123,17 @@ telemetry.init(
 )
 ```
 
+The roster and the user id are two different inputs, and the SDK needs both:
+
+| | Where it comes from | Answers |
+|---|---|---|
+| `user_id` | The agent system's code, via `start_request()` on every request | Who is making this call? |
+| `identity_roster="config/identities.csv"` | A file given to `init()` once, at startup (the IAM export) | What is that person allowed to access? |
+
+The SDK joins them on every event: the event's `user_id` selects that identity's entries
+in the roster, and what the call read is checked against them. The roster's `id` column must
+therefore hold the same values your code passes as `user_id` (see "Identify the User").
+
 Main parameters (all are documented in the `init()` docstring):
 
 | Parameter | Default | Purpose |
@@ -114,7 +144,9 @@ Main parameters (all are documented in the `init()` docstring):
 | `identity_roster` | `None` | Identity/entitlement CSV: one manifest per identity |
 | `system_prompt`, `permitted_sources`, `permitted_tools`, `permitted_classifications`, `prohibited_sources` | `None` | Declare a single agent's scope directly (no roster) |
 | `pii_api_key`, `pii_api_endpoint` | `None` | Zendata PII API labelling on the flush thread |
-| `pii_concurrency` | `4` | PII API calls made at once per flush batch |
+| `max_queue_size` | `1000` | Events held for the background flush. When full, new events are dropped (counted and reported at shutdown) |
+| `pii_label_llm_input` | `True` | `False` sends only the model's answer of an `llm_call` to the PII API, when user messages and tool results are captured as their own events |
+| `pii_concurrency` | `1` | PII API calls made at once per flush batch. The PII service serves one request per task, so keep this at or below its task count |
 | `pii_redactor` | `None` | Your own redactor (masks and labels); otherwise the built-in classifier labels only (`classify_pii=True`) |
 | `auto_patch_openai`, `auto_patch_anthropic`, `auto_patch_boto3` | `False` | Auto-instrumentation; boto3 reports the real bucket/table/secret ARN as the source |
 | `baseline_path` / `baseline_store` | `None` | Offline baselines (`python -m ai_telemetry.baseline_builder`) for the soft scope boundary |
@@ -151,6 +183,17 @@ request carries `tools_called` and the sources read. Setting `current_user_conte
 directly still works, but tools run on other threads (LangChain's executor, for example)
 are then invisible to later events.
 
+**Threads.** The request context is a `contextvars` value. LangChain copies it into the
+threads it runs tools on, so nothing is needed there. If **your own code** runs a tool on a
+thread (`ThreadPoolExecutor`, `loop.run_in_executor`), copy the context explicitly, or the
+tool's events have no user and the request loses its tools and sources:
+
+```python
+import contextvars
+ctx = contextvars.copy_context()
+await loop.run_in_executor(None, ctx.run, my_tool, arg)      # or: pool.submit(ctx.run, my_tool, arg)
+```
+
 Optional context keys the SDK reads:
 
 | Key | Effect |
@@ -161,7 +204,66 @@ Optional context keys the SDK reads:
 | `caller_api_key` / `caller_api_key_hash` | Identifies a machine caller's credential (gives each agent its own `agent_id`) |
 | `force_entity_type` | Forces the label on `llm_call` and `tool_call` events (see §3c) |
 
+### Identify the User
+
+The SDK does not work out who is calling. Your application tells it, once per request,
+through `start_request()`, and the SDK stamps that identity on every event of the request
+(the user message, every LLM call, every tool call).
+
+**Where the id comes from: your own authentication.** Identify the caller the way your
+application already does (SSO session, JWT, API key) and pass the result. The SDK records
+what you assert; it does not authenticate anyone.
+
+```python
+from ai_telemetry.context import start_request
+
+user = authenticate(request)                 # YOUR login: SSO / JWT / session
+start_request(
+    user_id=user.id,                         # MUST be the id used in the identity roster
+    email=user.email, display_name=user.name,
+    department=user.department, job_title=user.title,
+    sailpoint_risk=user.risk_score,          # optional: the IAM risk score, if you have one
+    session_id=request.session_id,
+    prompt_text=question,
+    prompt_submission_time_ms=int(time.time() * 1000),
+)
+```
+
+**Service accounts and agents** also pass the credential they authenticated with. The SDK
+hashes it (`api_key_hash`) and derives the agent's `agent_id` from it, so each service
+account is its own agent with its own drift baseline:
+
+```python
+start_request(user_id="svc_trading_bot", caller_api_key=presented_key, ...)
+```
+
+**What the id is used for**
+
+| Use | How |
+|---|---|
+| Attribution | `user_id`, `email`, `display_name`, `department`, `job_title` on every event |
+| Scope check | the event's `user_id` selects that identity's manifest from the roster (§3e); a read outside its entitlements is `SC_OUT_OF_SCOPE_SOURCE` |
+| Human vs machine | session state and the classifier are tracked per `user_id` (§3b) |
+| Risk | `sailpoint_risk` is the starting point of `zendata_composite_risk` |
+
+**Rules that make identification work**
+
+1. **Same id everywhere.** The `user_id` you pass must be exactly the `id` column of the
+   identity roster you give `init(identity_roster=...)` and upload to the Zendata scan. If
+   your application uses emails and the IAM export uses employee ids, nothing matches:
+   every read looks out of scope and no identity details join.
+2. **Call it before the first LLM or tool call** of the request. Events captured without it
+   are attributed to `"unknown"`.
+3. **Once per request**, not once per process: the context is per request, so concurrent
+   requests from different users never mix.
+4. **Pass the real caller.** In an agent that acts on a user's behalf, the identity is the
+   user's, not the agent's; a service account calling on its own is its own identity.
+
 ### Step 3: Decorating Functions
+
+Decorate **after** `telemetry.init()`: `@trace_tool(t, ...)` takes the client, so `t` must
+exist when the decorator runs (define the tools after `init()`, or build them in a function
+called after it, as the virtual bank's `build_tools(t)` does).
 
 ```python
 from ai_telemetry.decorators import trace_llm, trace_tool
@@ -204,6 +306,93 @@ telemetry.get_client().shutdown()     # flushes the queue
 ```
 
 For short-lived processes, carry learned state between runs (see §3f).
+
+### Putting it together: one complete, tested example
+
+Everything above in one file: init, two tools, an egress, a LangChain model, one request.
+It runs as is (`pip install langchain-core` plus the SDK; no network — the endpoint is a
+dead address and events also go to a local CSV).
+
+```python
+import asyncio, os, time
+os.environ.setdefault("ZENDATA_ENGINE_URL", "mock")        # built-in risk evaluator
+
+import ai_telemetry as telemetry
+from ai_telemetry.client import TelemetryEvent
+from ai_telemetry.context import TraceContext, start_request, record_egress
+from ai_telemetry.decorators import trace_tool
+from ai_telemetry.integrations.langchain_integration import create_langchain_handler
+from langchain_core.tools import tool
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+# 1. init — once, before any tool is decorated
+telemetry.init(app_id="my-app", api_key="zdi_your_project_key", endpoint="http://127.0.0.1:9/disabled",
+               identity_roster="identities.csv",              # usr_ana: accounts_db.read|reports.read
+               enable_local_log=True, log_path="./events.csv")
+t = telemetry.get_client()
+
+# 2. tools — @tool on top, @trace_tool underneath; source names = roster resource names
+def _source(args, kwargs, result):
+    return f"{kwargs['resource']}/records"
+
+@tool
+@trace_tool(t, tool_name="search_records", source_uri=_source)
+def search_records(resource: str, query: str) -> str:
+    """Search a resource."""
+    return "row: 078-05-1120"
+
+@tool
+@trace_tool(t, tool_name="send_email")
+def send_email(to: str) -> str:
+    """Send an email."""
+    record_egress(f"mailto:{to}", external=not to.endswith("@acme.com"))
+    return "sent"
+
+# 3. agent — model calls through the handler; tools already traced, so capture_tools=False
+llm = FakeListChatModel(responses=["Here is the summary."])     # your real chat model here
+handler = create_langchain_handler(t, capture_tools=False, agent_name="my-agent")
+
+# 4. one request — identity first, then the user's turn, then the agent's work
+async def chat(question: str):
+    ctx = start_request(user_id="usr_ana", email="ana@acme.com", display_name="Ana Lima",
+                        department="Finance", job_title="Analyst", sailpoint_risk="20",
+                        prompt_text=question, prompt_submission_time_ms=int(time.time() * 1000))
+    TraceContext.start_trace()
+    t.capture(TelemetryEvent(event_type="user_message", user_id=ctx["user_id"],
+              email=ctx["email"], display_name=ctx["display_name"], department=ctx["department"],
+              job_title=ctx["job_title"], sailpoint_risk=ctx["sailpoint_risk"],
+              input_messages=[{"role": "user", "content": question}]))
+    await search_records.ainvoke({"resource": "accounts_db", "query": "x"})   # in scope
+    await search_records.ainvoke({"resource": "payroll_db", "query": "x"})    # NOT entitled
+    await send_email.ainvoke({"to": "x@gmail.com"})                           # leaves the org
+    return await llm.ainvoke(question, config={"callbacks": [handler]})
+
+asyncio.run(chat("summarise my accounts"))
+t.shutdown()                                                    # 5. flush
+```
+
+What it writes to `events.csv` (selected columns):
+
+| event_type | user | data_sources | scope_violation_count | trust_boundary_crossed | pii_types |
+|---|---|---|---|---|---|
+| `user_message` | usr_ana, Finance | | | False | |
+| `tool_call` | usr_ana, Finance | `accounts_db/records` | | False | SSN |
+| `tool_call` | usr_ana, Finance | `payroll_db/records` | **1** | False | SSN |
+| `tool_call` (send_email) | usr_ana, Finance | | | **True** | EMAIL |
+| `llm_call` | usr_ana, Finance | both sources | **1** | **True** | |
+
+The model call carries everything the request did (`tools_called`, sources, the scope
+violation, the boundary crossing) — that is what `start_request()` buys you.
+
+### Delivery counters (`stats()`)
+
+`telemetry.get_client().stats()` returns cheap, thread-safe counters since the
+client was created — useful for a host's own `/stats` or health endpoint:
+`captured`, `dropped` (queue full), `queued`, `queue_max`, `sent_events` and
+`sent_batches` (2xx POSTs), `send_failures` (batches not delivered: 4xx,
+retries exhausted, or circuit breaker open), `pii_calls` / `pii_failures`
+(PII API requests, cache misses only), and `last_send_ms` / `last_capture_ms`
+(epoch ms, `None` until first seen).
 
 ---
 
@@ -328,11 +517,14 @@ async def chat(req: QueryRequest, request: Request):
     )
     TraceContext.start_trace()
 
-    # Phase 2: the human turn — classified from behaviour
+    # Phase 2: the human turn — classified from behaviour. capture() does NOT copy the
+    # caller from the context (the decorators and the LangChain handler do), so pass it.
     tokens = max(1, len(req.question) // 4)
     telemetry.get_client().capture(TelemetryEvent(
         event_type="user_message",
-        user_id=req.user_id,
+        user_id=ctx["user_id"], email=ctx["email"], display_name=ctx["display_name"],
+        department=ctx["department"], job_title=ctx["job_title"],
+        sailpoint_risk=ctx["sailpoint_risk"],
         input_messages=[{"role": "user", "content": req.question}],
         prompt_tokens=tokens, total_tokens=tokens,
     ))
@@ -413,7 +605,7 @@ import ai_telemetry as telemetry
 os.environ.setdefault("ZENDATA_ENGINE_URL", "mock")   # built-in risk evaluator — without it
                                                        # pii_detected / composite risk stay empty
 telemetry.init(
-    app_id="claims-bot",                               # the app_id your code declares
+    app_id="claims-bot",                               # = step 4 "Application identity"
     api_key=os.environ["ZENDATA_API_KEY"],             # the project key (zdi_…)
     endpoint="https://dashboard.zendata.dev/api/telemetry/ingest",
 )
@@ -424,6 +616,14 @@ your chatbot one message, wait ~10 s, then press **Run Connectivity Test** in th
 
 > If the wizard shows "Unavailable (NetworkError …)" for the endpoint and key, a browser
 > content blocker is blocking URLs containing `telemetry`. Allow the dashboard's domain.
+
+**Before relying on it, read how the key and endpoint behave**
+([`docs/CLIENT_INTEGRATION.md` §9](docs/CLIENT_INTEGRATION.md#how-the-key-and-endpoint-behave)):
+the key is per user, not per project, and a scan collects everything received under it in
+its window; `app_id` must match the scan's Application identity or code findings stay
+LATENT; only batches received before the scan's 20 s post-traffic wait are collected; a
+POST is limited to 1,000 events / 5 MB (larger batches are refused and not retried); a
+single key cannot be rotated on its own.
 
 **2. Accept Zendata's test calls.** During the scan Zendata (from IP **3.84.255.108**) calls:
 
