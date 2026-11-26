@@ -340,7 +340,8 @@ Set `capture_prompts: false` (Python) or `capturePrompts: false` (JS) to strip a
 
 ## License
 
-MIT
+Proprietary. Copyright (c) 2026 Zendata, Inc. All rights reserved. Use is governed by
+your written agreement with Zendata, Inc.; see [LICENSE](LICENSE).
 
 ## Framework Agnostic Design
 
