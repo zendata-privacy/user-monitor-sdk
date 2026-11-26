@@ -8,7 +8,8 @@ version = "1.0.0"
 description = "AI application telemetry — capture prompts, completions, tool calls, tokens, and errors."
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
+license = "LicenseRef-Proprietary"
+license-files = ["LICENSE"]
 keywords = ["ai", "telemetry", "observability", "llm", "openai", "anthropic", "langchain"]
 
 dependencies = []  # zero hard dependencies — integrations are optional
