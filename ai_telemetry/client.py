@@ -4,7 +4,9 @@ Sends telemetry events to your configured endpoint.
 """
 
 import atexit
+import collections
 import hashlib
+import random
 import time
 import uuid
 import threading
@@ -320,6 +322,16 @@ class TelemetryClient:
         self._consecutive_failures: int = 0
         self._circuit_open_until: float = 0.0
 
+        # Batches waiting for a retry (429, 5xx, network error, circuit open).
+        # Retried by the flush loop when due, never by sleeping in it, so one
+        # slow endpoint doesn't stop newer batches from being sent. Bounded by
+        # max_queue_size events (oldest dropped and counted); a batch is given
+        # up after RETRY_FOR_S seconds.
+        self._retry: "collections.deque[Dict[str, Any]]" = collections.deque()
+        self._retry_events = 0
+        self._retried_batches = 0
+        self._dropped_after_retry = 0
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -504,8 +516,13 @@ class TelemetryClient:
 
         captured/dropped: events accepted into / refused by the queue.
         sent_events/sent_batches: events and POSTs the endpoint accepted (2xx).
-        send_failures: batches that were not delivered (4xx, retries
-        exhausted, or skipped while the circuit breaker was open).
+        send_failures: failed delivery attempts (4xx, 429, 5xx, network error,
+        or skipped while the circuit breaker was open). A batch that failed
+        with 429/5xx/network is retried later, so it may still arrive.
+        retry_pending_batches/retry_pending_events: waiting for a retry.
+        retried_batches: retry attempts made.
+        dropped_after_retry: events given up on (retried for RETRY_FOR_S,
+        retry backlog full, or still pending at shutdown).
         pii_calls/pii_failures: PII API requests made (cache misses only).
         last_send_ms/last_capture_ms: epoch ms, None until it first happens.
         """
@@ -522,6 +539,10 @@ class TelemetryClient:
             out["dropped"] = self.dropped_events
         out["queued"] = self._queue.qsize()
         out["queue_max"] = self.max_queue_size
+        out["retry_pending_batches"] = len(self._retry)
+        out["retry_pending_events"] = self._retry_events
+        out["retried_batches"] = self._retried_batches
+        out["dropped_after_retry"] = self._dropped_after_retry
         out["pii_calls"] = int(getattr(self.pii_classifier, "calls", 0) or 0)
         out["pii_failures"] = int(getattr(self.pii_classifier, "failures", 0) or 0)
         return out
@@ -544,7 +565,11 @@ class TelemetryClient:
         as soon as it is enriched keeps delivery flowing and the queue short.
         Serialised: a second caller waits, then finds the queue already drained.
         """
+        self._flush(force_retries=False)
+
+    def _flush(self, force_retries: bool) -> None:
         with self._flush_lock:
+            self._send_due_retries(force_retries)
             while True:
                 events = []
                 while len(events) < self.batch_size:
@@ -553,13 +578,18 @@ class TelemetryClient:
                     except queue.Empty:
                         break
                 if not events:
-                    return
+                    break
                 self._send(events)
+            if force_retries:
+                # The process is exiting: whatever is still parked can't be retried.
+                while self._retry:
+                    self._drop_retry(self._retry.popleft(), "not delivered before shutdown")
+                self._retry_events = 0
 
     def shutdown(self):
         """Flush remaining events and stop the background thread."""
         self._shutdown.set()
-        self.flush()
+        self._flush(force_retries=True)
         self._thread.join(timeout=5)
         if self.dropped_events:
             print(f"[AI Telemetry] {self.dropped_events} event(s) were dropped because the "
@@ -724,19 +754,14 @@ class TelemetryClient:
         event.pii_types = "|".join(sorted(existing | found))
         event.pii_detected = True
 
+    # Delivery: one attempt per batch per flush; failures wait in self._retry.
+    _CIRCUIT_THRESHOLD = 5
+    _CIRCUIT_COOLDOWN_S = 30.0
+    RETRY_FOR_S = 900.0          # give a batch up after 15 minutes
+    _BACKOFF_CAP_S = 60.0
+    _RETRYABLE_4XX = (408, 425, 429)
+
     def _send_http(self, events: List[TelemetryEvent]):
-        _MAX_RETRIES = 3
-        _BACKOFF_BASE = 1.0
-        _CIRCUIT_THRESHOLD = 5
-        _CIRCUIT_COOLDOWN_S = 30.0
-
-        # Circuit breaker: skip entirely if endpoint is known-down
-        if self._circuit_open_until > time.time():
-            if self.debug:
-                print("[AI Telemetry] Circuit open — skipping send")
-            self._count_send(False)
-            return
-
         serializable = []
         for e in events:
             try:
@@ -747,54 +772,132 @@ class TelemetryClient:
                     print(f"[AI Telemetry] Skipping non-serializable event {e.event_id}: {ex}")
         if not serializable:
             return
-        payload = json.dumps({"events": serializable}).encode()
+        # batch_id is the same on every retry of this batch, so the receiver
+        # can drop duplicates. Receivers that don't know it ignore it.
+        batch_id = uuid.uuid4().hex
+        batch = {
+            "payload": json.dumps({"batch_id": batch_id, "events": serializable}).encode(),
+            "batch_id": batch_id,
+            "n": len(serializable),
+            "attempt": 0,
+            "first_try": time.time(),
+            "due": 0.0,
+        }
+        if self._circuit_open_until > time.time():
+            # Endpoint known to be down: park the batch instead of dropping it.
+            if self.debug:
+                print("[AI Telemetry] Circuit open — batch queued for retry")
+            self._count_send(False)
+            batch["due"] = self._circuit_open_until
+            self._park(batch)
+            return
+        self._attempt(batch)
+
+    def _attempt(self, batch: Dict[str, Any]) -> bool:
+        """POST one batch once. Returns False when the endpoint looked down
+        (network error or 5xx), so a shutdown flush can stop early."""
         req = urllib.request.Request(
             self.endpoint,
-            data=payload,
+            data=batch["payload"],
             headers={
                 "Content-Type": "application/json",
                 "X-API-Key": self.api_key,
+                "X-Batch-Id": batch["batch_id"],
                 "User-Agent": "ai-telemetry-sdk-python/1.0.0",
             },
             method="POST",
         )
-
-        last_err: Exception = Exception("unknown")
-        for attempt in range(_MAX_RETRIES):
-            try:
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    if self.debug:
-                        print(f"[AI Telemetry] Flushed {len(events)} events → {resp.status}")
-                    self._consecutive_failures = 0
-                    self._count_send(True, len(serializable))
-                    return  # success
-            except urllib.error.HTTPError as e:
-                if e.code < 500:
-                    # 4xx — client error, don't retry
-                    self._consecutive_failures = 0
-                    if self.debug:
-                        print(f"[AI Telemetry] Send failed (client error {e.code}): {e}")
-                    self._count_send(False)
-                    return
-                last_err = e  # 5xx — fall through to retry
-            except urllib.error.URLError as e:
-                last_err = e  # network error — retry
-
-            if attempt < _MAX_RETRIES - 1:
-                wait = _BACKOFF_BASE * (2 ** attempt)
+        batch["attempt"] += 1
+        retry_after: Optional[float] = None
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 if self.debug:
-                    print(f"[AI Telemetry] Retry {attempt + 1}/{_MAX_RETRIES} in {wait}s: {last_err}")
-                time.sleep(wait)
+                    print(f"[AI Telemetry] Flushed {batch['n']} events → {resp.status}")
+                self._consecutive_failures = 0
+                self._count_send(True, batch["n"])
+                return True
+        except urllib.error.HTTPError as e:
+            if e.code < 500 and e.code not in self._RETRYABLE_4XX:
+                # Client error (bad key, bad payload): retrying won't help.
+                self._consecutive_failures = 0
+                if self.debug:
+                    print(f"[AI Telemetry] Send failed (client error {e.code}): {e}")
+                self._count_send(False)
+                return True
+            retry_after = self._retry_after(e)
+            err: Exception = e
+            # 429 means the endpoint is up and throttling us: not an outage.
+            endpoint_down = e.code >= 500
+        except (urllib.error.URLError, OSError) as e:
+            err = e
+            endpoint_down = True
 
-        # All retries exhausted
         self._count_send(False)
-        self._consecutive_failures += 1
-        if self._consecutive_failures >= _CIRCUIT_THRESHOLD:
-            self._circuit_open_until = time.time() + _CIRCUIT_COOLDOWN_S
-            if self.debug:
-                print(f"[AI Telemetry] Circuit opened for {_CIRCUIT_COOLDOWN_S}s after {self._consecutive_failures} consecutive failures")
+        if endpoint_down:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._CIRCUIT_THRESHOLD:
+                self._circuit_open_until = time.time() + self._CIRCUIT_COOLDOWN_S
+                if self.debug:
+                    print(f"[AI Telemetry] Circuit opened for {self._CIRCUIT_COOLDOWN_S}s after "
+                          f"{self._consecutive_failures} consecutive failures")
+        # Exponential backoff with jitter, never shorter than Retry-After, so
+        # many app servers retrying after an outage don't all arrive at once.
+        backoff = min(self._BACKOFF_CAP_S, 2.0 ** (batch["attempt"] - 1))
+        wait = max(retry_after or 0.0, backoff * random.uniform(0.5, 1.5))
+        batch["due"] = max(time.time() + wait, self._circuit_open_until)
         if self.debug:
-            print(f"[AI Telemetry] Send failed after {_MAX_RETRIES} retries: {last_err}")
+            print(f"[AI Telemetry] Send attempt {batch['attempt']} failed ({err}); retry in {wait:.1f}s")
+        self._park(batch)
+        return not endpoint_down
+
+    @staticmethod
+    def _retry_after(e: urllib.error.HTTPError) -> Optional[float]:
+        try:
+            value = e.headers.get("Retry-After") if e.headers else None
+            return max(0.0, float(value)) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _park(self, batch: Dict[str, Any]) -> None:
+        if time.time() - batch["first_try"] > self.RETRY_FOR_S:
+            self._drop_retry(batch, "gave up after retrying for "
+                                    f"{int(self.RETRY_FOR_S)}s")
+            return
+        self._retry.append(batch)
+        self._retry_events += batch["n"]
+        # Bounded like the capture queue: drop the oldest batches first.
+        while self._retry_events > self.max_queue_size and len(self._retry) > 1:
+            self._retry_events -= self._retry[0]["n"]
+            self._drop_retry(self._retry.popleft(), "retry backlog full")
+
+    def _drop_retry(self, batch: Dict[str, Any], why: str) -> None:
+        with self._stats_lock:
+            self._dropped_after_retry += batch["n"]
+        print(f"[AI Telemetry] Dropped a batch of {batch['n']} event(s): {why}.")
+
+    def _send_due_retries(self, force: bool) -> None:
+        """Retry parked batches whose time has come (all of them when force,
+        i.e. at shutdown, stopping at the first sign the endpoint is down)."""
+        if not self._retry:
+            return
+        now = time.time()
+        if not force and self._circuit_open_until > now:
+            return
+        pending = list(self._retry)
+        self._retry.clear()
+        self._retry_events = 0
+        for i, batch in enumerate(pending):
+            if not force and batch["due"] > now:
+                self._retry.append(batch)
+                self._retry_events += batch["n"]
+                continue
+            with self._stats_lock:
+                self._retried_batches += 1
+            up = self._attempt(batch)
+            if force and not up:
+                for rest in pending[i + 1:]:
+                    self._drop_retry(rest, "endpoint unreachable at shutdown")
+                break
 
     @staticmethod
     def _existing_csv_header(path: str) -> List[str]:

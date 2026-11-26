@@ -182,6 +182,23 @@ describe("HTTP error handling", () => {
     await client.shutdown();
   });
 
+  it("429 is retried with the same batch_id", async () => {
+    mockFetch
+      .mockResolvedValueOnce({ ok: false, status: 429, headers: new Headers({ "Retry-After": "0" }) } as Response)
+      .mockResolvedValueOnce(okResponse());
+    const client = makeClient();
+    client.capture({ event_type: "llm_call" });
+    await client.flush();
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const ids = mockFetch.mock.calls.map(
+      (c) => JSON.parse(((c as unknown[])[1] as { body: string }).body).batch_id,
+    );
+    expect(ids[0]).toBeTruthy();
+    expect(ids[0]).toBe(ids[1]);
+    expect((client as unknown as { consecutiveFailures: number }).consecutiveFailures).toBe(0);
+    await client.shutdown();
+  });
+
   it("5xx increments consecutiveFailures", async () => {
     mockFetch.mockResolvedValue({ ok: false, status: 503 } as Response);
     const client = makeClient();
