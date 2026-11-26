@@ -401,7 +401,9 @@ class TestStats:
         assert s == {"captured": 0, "dropped": 0, "queued": 0, "queue_max": client.max_queue_size,
                      "sent_events": 0, "sent_batches": 0, "send_failures": 0,
                      "pii_calls": 0, "pii_failures": 0,
-                     "last_send_ms": None, "last_capture_ms": None}
+                     "last_send_ms": None, "last_capture_ms": None,
+                     "retry_pending_batches": 0, "retry_pending_events": 0,
+                     "retried_batches": 0, "dropped_after_retry": 0}
 
     def test_counts_capture_and_successful_send(self, client, mock_server):
         for _ in range(3):

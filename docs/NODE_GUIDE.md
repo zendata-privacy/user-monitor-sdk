@@ -78,6 +78,9 @@ Two behaviours worth knowing before you deploy:
 - **There is a circuit breaker.** After 5 consecutive flush failures the client
   stops attempting delivery for a cooldown period. A telemetry outage degrades
   to dropped events, not to a degraded application.
+- **Throttling is retried.** A 429 (rate limited) is retried like a 5xx, never
+  sooner than the server's `Retry-After`, with jittered backoff. Each batch
+  carries a `batch_id`, the same on every retry.
 
 ### Suppressing prompt content
 

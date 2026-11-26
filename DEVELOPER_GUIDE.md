@@ -389,10 +389,23 @@ violation, the boundary crossing) — that is what `start_request()` buys you.
 `telemetry.get_client().stats()` returns cheap, thread-safe counters since the
 client was created — useful for a host's own `/stats` or health endpoint:
 `captured`, `dropped` (queue full), `queued`, `queue_max`, `sent_events` and
-`sent_batches` (2xx POSTs), `send_failures` (batches not delivered: 4xx,
-retries exhausted, or circuit breaker open), `pii_calls` / `pii_failures`
-(PII API requests, cache misses only), and `last_send_ms` / `last_capture_ms`
-(epoch ms, `None` until first seen).
+`sent_batches` (2xx POSTs), `send_failures` (failed delivery attempts: 4xx,
+429, 5xx, network error, or circuit breaker open), `pii_calls` / `pii_failures`
+(PII API requests, cache misses only), `last_send_ms` / `last_capture_ms`
+(epoch ms, `None` until first seen), and the retry counters
+`retry_pending_batches` / `retry_pending_events`, `retried_batches` and
+`dropped_after_retry`.
+
+**Delivery retries.** A batch refused with 429 (rate limited) or 5xx, or not
+delivered because of a network error or an open circuit breaker, is kept and
+retried by the background flush when it is due: exponential backoff with
+jitter, never sooner than the server's `Retry-After`, for up to 15 minutes.
+Retries never sleep in the flush thread, so newer batches keep flowing. The
+retry backlog is bounded by `max_queue_size` events (oldest dropped first) and
+whatever is still pending at shutdown is dropped; both are counted in
+`dropped_after_retry`. Other 4xx errors (bad key, invalid batch) are not
+retried. Every batch carries a `batch_id` (body and `X-Batch-Id` header), the
+same on each retry, so the receiver can discard duplicates.
 
 ---
 

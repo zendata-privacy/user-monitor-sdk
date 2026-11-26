@@ -228,16 +228,21 @@ export class TelemetryClient {
       return;
     }
 
+    // Same batch_id on every retry, so the receiver can drop duplicates.
+    const batchId = randomUUID().replace(/-/g, "");
+    const body = JSON.stringify({ batch_id: batchId, events });
     for (let attempt = 0; attempt < this.maxRetries; attempt++) {
+      let retryAfterMs = 0;
       try {
         const res = await fetch(this.endpoint, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             "X-API-Key": this.apiKey,
+            "X-Batch-Id": batchId,
             "User-Agent": "ai-telemetry-sdk-js/1.0.0",
           },
-          body: JSON.stringify({ events }),
+          body,
         });
 
         if (res.ok) {
@@ -248,7 +253,14 @@ export class TelemetryClient {
           return;
         }
 
-        if (res.status < 500) {
+        if (res.status === 408 || res.status === 425 || res.status === 429) {
+          // Throttled / not ready: retry, never sooner than Retry-After (capped at 60 s).
+          const ra = Number(res.headers?.get?.("Retry-After"));
+          retryAfterMs = Number.isFinite(ra) && ra > 0 ? Math.min(ra, 60) * 1000 : 0;
+          if (this.debug) {
+            console.warn(`[AI Telemetry] Throttled (${res.status}), attempt ${attempt + 1}/${this.maxRetries}`);
+          }
+        } else if (res.status < 500) {
           // 4xx — client error, don't retry
           this.consecutiveFailures = 0;
           if (this.debug) {
@@ -258,7 +270,7 @@ export class TelemetryClient {
         }
 
         // 5xx — fall through to retry
-        if (this.debug) {
+        else if (this.debug) {
           console.warn(`[AI Telemetry] Server error ${res.status}, attempt ${attempt + 1}/${this.maxRetries}`);
         }
       } catch (err) {
@@ -269,7 +281,9 @@ export class TelemetryClient {
       }
 
       if (attempt < this.maxRetries - 1) {
-        await new Promise(r => setTimeout(r, 1000 * 2 ** attempt));
+        // Exponential backoff with jitter, so many processes don't retry in step.
+        const backoffMs = 1000 * 2 ** attempt * (0.5 + Math.random());
+        await new Promise(r => setTimeout(r, Math.max(retryAfterMs, backoffMs)));
       }
     }
 
